@@ -5,7 +5,7 @@
 - [x] 锁定 Go、Wails 和 FRP 具体版本。
 - [x] 安装 React 19、TypeScript、Tailwind v4、motion/react、lucide-react。
 - [x] 配置 760x480、Frameless、DisableResize。
-- [x] 创建 40px 无边框标题栏和 Wails 拖拽区域。
+- [x] 使用覆盖式无边框拖拽区域；最小化和关闭固定在右上角，不额外占用标题栏。
 - [x] 完成登录页和控制台双栏静态 UI。
 - [x] 配置暗色主题、Inter、JetBrains Mono 和 reduced-motion。
 
