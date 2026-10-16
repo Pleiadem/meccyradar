@@ -136,7 +136,7 @@ export default function App() {
 function WindowShell({ authenticated, onLogout, children }: { authenticated: boolean; onLogout: () => void; children: ReactNode }) {
   return <div className="min-h-screen w-full bg-black text-white">
     <header className="flex h-10 items-center justify-between border border-white/10 bg-brand-gray px-4 text-xs" style={{ '--wails-draggable': 'drag' } as CSSProperties}>
-      <span className="font-semibold tracking-wide">MeccyRadar <span className="ml-2 text-white/40">:13133</span></span>
+      <span className="font-semibold tracking-wide">MeccyRadar</span>
       <div className="flex items-center gap-1" style={{ '--wails-draggable': 'no-drag' } as CSSProperties}>
         {authenticated && <button aria-label="退出登录" onClick={onLogout} className="rounded-lg px-2 py-1.5 text-white/50 hover:bg-white/10 hover:text-white">退出登录</button>}
         <button aria-label="最小化" onClick={() => runtime?.WindowMinimise?.()} className="rounded-lg p-2 text-white/50 hover:bg-white/10 hover:text-white"><Minus size={14} /></button>
