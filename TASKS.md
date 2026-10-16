@@ -100,7 +100,7 @@
 - [x] 完成单卡多开 409 测试。
 - [x] 完成固定远程端口测试。
 - [x] 完成服务端到期和客户端到期双重断连测试。
-- [ ] 完成 TCP/HTTP FRP 实际连接测试。
+- [x] 完成 TCP/HTTP FRP 实际连接测试（本机 FRPS v0.71.0 数据面联调）。
 - [ ] 完成 Windows 10/11 真机测试。
 - [ ] 配置 Windows WebView2 策略并测试离线/国内网络场景。
 - [ ] 生成绿色版 EXE，必要时使用 `wails build -clean -platform windows/amd64 -upx`。
