@@ -89,6 +89,7 @@ export default function App() {
       setInit({ authenticated: true, appName: 'MeccyRadar', expireAtStr: '测试授权', expireAtUnix: Math.floor(Date.now() / 1000) + 3 * 86400, tunnelStatus: 'connected' })
       setPingMs(28)
       setPortOpen(true)
+      setCardKey('CARD-1')
       setRadarPassword('sample-pass')
       setLogs([{ at: '12:30:04', message: '隧道连接成功，等待客户端请求' }, { at: '12:30:08', message: '本地代理状态正常' }])
     }
@@ -134,7 +135,7 @@ export default function App() {
 
   const logout = async () => {
     setBusy(true)
-    try { await backend?.Logout?.(); setInit({ authenticated: false, tunnelStatus: 'idle' }); setCardKey('') } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
+    try { await backend?.Logout?.(); setInit({ authenticated: false, tunnelStatus: 'idle' }); setError('') } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
   }
 
   if (!hydrated) return <div className="flex min-h-screen items-center justify-center bg-black text-sm text-white/50">正在加载…</div>
@@ -149,8 +150,10 @@ export default function App() {
 
 function WindowShell({ authenticated, onLogout, children }: { authenticated: boolean; onLogout: () => void; children: ReactNode }) {
   return <div className="relative h-[100dvh] w-full overflow-hidden bg-black text-white">
-    <div aria-hidden="true" className="absolute left-0 top-0 z-20 h-9 w-[calc(100%-104px)]" style={{ '--wails-draggable': 'drag' } as CSSProperties} />
-    <div className="absolute right-2 top-2 z-30 flex items-center gap-1" style={{ '--wails-draggable': 'no-drag' } as CSSProperties}>
+    <div className="absolute left-0 top-0 z-20 h-11 w-[calc(100%-112px)]" style={{ '--wails-draggable': 'drag' } as CSSProperties}>
+      {authenticated && <span className="absolute left-4 top-1/2 flex -translate-y-1/2 items-center gap-2 text-xs font-semibold tracking-wide text-white/85"><Radar size={15} strokeWidth={1.8} />MeccyRadar</span>}
+    </div>
+    <div className="absolute right-2 top-1.5 z-30 flex items-center gap-1" style={{ '--wails-draggable': 'no-drag' } as CSSProperties}>
       {authenticated && <button aria-label="退出登录" onClick={onLogout} className="mr-1 rounded-lg px-2.5 py-2 text-xs text-white/55 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40">退出登录</button>}
       <button aria-label="最小化" title="最小化" onClick={() => runtime?.WindowMinimise?.()} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"><Minus size={15} strokeWidth={1.8} /></button>
       <button aria-label="关闭" title="关闭" onClick={() => runtime?.Quit?.()} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-rose-500/80 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/70"><X size={15} strokeWidth={1.8} /></button>
