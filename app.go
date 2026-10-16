@@ -214,7 +214,7 @@ func (a *App) startTunnel() error {
 		Heartbeater:       client,
 		Hooks: monitor.Hooks{
 			Emit:       func(event monitor.Event) { a.handleMonitorEvent(event) },
-			StopTunnel: func(error) { _ = a.stopTunnel() },
+			StopTunnel: func(error) { _ = a.stopEngineFromMonitor() },
 			Log:        func(message string) { a.emitLog(message) },
 		},
 	}
@@ -246,6 +246,18 @@ func (a *App) stopTunnel() error {
 	if mon != nil && mon.Running() {
 		_ = mon.Stop()
 	}
+	if engine != nil && engine.Running() {
+		return engine.Stop()
+	}
+	return nil
+}
+
+func (a *App) stopEngineFromMonitor() error {
+	a.mu.Lock()
+	engine := a.engine
+	a.engine = nil
+	a.lastStatus = "idle"
+	a.mu.Unlock()
 	if engine != nil && engine.Running() {
 		return engine.Stop()
 	}
