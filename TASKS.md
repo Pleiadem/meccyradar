@@ -53,14 +53,14 @@
 
 ## 阶段五：监测、倒计时和事件
 
-- [ ] 创建 `internal/monitor`。
-- [ ] 对管理端返回的 FRP 节点执行 3 次 TCP 测速，取最低值。
-- [ ] 每 3 秒探测 `127.0.0.1:13133`。
-- [ ] 端口检测不阻止链接生成。
-- [ ] 实现客户端到期看门狗。
-- [ ] 每秒或合理频率推送剩余时间。
-- [ ] 推送 `tunnel:status`、`port:status`、`log:append`。
-- [ ] 正确处理 idle、connecting、connected、expired、conflict、error。
+- [x] 创建 `internal/monitor`。
+- [x] 对管理端返回的 FRP 节点执行 3 次 TCP 测速，取最低值。
+- [x] 每 3 秒探测 `127.0.0.1:13133`。
+- [x] 端口检测不阻止链接生成。
+- [x] 实现客户端到期看门狗。
+- [x] 每秒或合理频率推送剩余时间。
+- [x] 推送 `tunnel:status`、`port:status`、`log:append`。
+- [x] 正确处理 idle、connecting、connected、expired、conflict、error。
 
 验证：模拟到期、端口变化、测速失败和心跳失败，确认 UI 状态与日志同步。
 
