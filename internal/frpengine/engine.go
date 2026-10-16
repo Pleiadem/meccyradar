@@ -23,12 +23,14 @@ var (
 )
 
 type LogFunc func(line string)
+type ExitFunc func(err error)
 
 type Engine struct {
 	mu sync.Mutex
 
 	config auth.FRPConfig
 	logs   LogFunc
+	onExit ExitFunc
 
 	service *frpclient.Service
 	cancel  context.CancelFunc
@@ -38,10 +40,14 @@ type Engine struct {
 }
 
 func New(config auth.FRPConfig, logs LogFunc) (*Engine, error) {
+	return NewWithExit(config, logs, nil)
+}
+
+func NewWithExit(config auth.FRPConfig, logs LogFunc, onExit ExitFunc) (*Engine, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
-	return &Engine{config: config, logs: logs}, nil
+	return &Engine{config: config, logs: logs, onExit: onExit}, nil
 }
 
 func (e *Engine) Start() error {
@@ -75,7 +81,7 @@ func (e *Engine) Start() error {
 	e.err = nil
 	previousLogger := frplog.Logger
 	frplog.Logger = goliblog.New(
-		goliblog.WithOutput(logWriter{callback: e.logs}),
+		goliblog.WithOutput(logWriter{callback: e.logs, secrets: []string{e.config.ServerAddr, e.config.Token, e.config.User}}),
 		goliblog.WithLevel(goliblog.InfoLevel),
 		goliblog.WithCaller(false),
 	)
@@ -89,6 +95,9 @@ func (e *Engine) Start() error {
 		e.mu.Unlock()
 		frplog.Logger = previousLogger
 		close(e.done)
+		if runErr != nil && !errors.Is(runErr, context.Canceled) && e.onExit != nil {
+			e.onExit(runErr)
+		}
 	}()
 	return nil
 }
@@ -119,13 +128,25 @@ func (e *Engine) LastError() error {
 	return e.err
 }
 
-type logWriter struct{ callback LogFunc }
+type logWriter struct {
+	callback LogFunc
+	secrets  []string
+}
 
 func (w logWriter) Write(p []byte) (int, error) {
 	if w.callback != nil {
-		w.callback(strings.TrimRight(string(p), "\r\n"))
+		w.callback(redactLogLine(strings.TrimRight(string(p), "\r\n"), w.secrets))
 	}
 	return len(p), nil
+}
+
+func redactLogLine(line string, secrets []string) string {
+	for _, secret := range secrets {
+		if strings.TrimSpace(secret) != "" {
+			line = strings.ReplaceAll(line, secret, "[REDACTED]")
+		}
+	}
+	return line
 }
 
 func validateConfig(config auth.FRPConfig) error {

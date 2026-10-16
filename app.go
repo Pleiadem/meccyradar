@@ -194,7 +194,7 @@ func (a *App) startTunnel() error {
 	a.mu.Unlock()
 
 	a.emitStatus("connecting", 0, "")
-	engine, err := frpengine.New(data.FRPConfig, func(line string) { a.emitLog(line) })
+	engine, err := frpengine.NewWithExit(data.FRPConfig, func(line string) { a.emitLog(line) }, func(err error) { a.handleEngineExit(err) })
 	if err != nil {
 		a.emitStatus("error", 0, err.Error())
 		return err
@@ -261,6 +261,20 @@ func (a *App) stopEngineFromMonitor() error {
 		return engine.Stop()
 	}
 	return nil
+}
+
+func (a *App) handleEngineExit(err error) {
+	a.mu.Lock()
+	mon := a.monitor
+	a.monitor = nil
+	a.engine = nil
+	a.lastStatus = "error"
+	a.mu.Unlock()
+	if mon != nil && mon.Running() {
+		_ = mon.Stop()
+	}
+	a.emitStatus("error", 0, err.Error())
+	a.emitLog("FRP tunnel exited: " + err.Error())
 }
 
 func (a *App) CopyShareLink(password string) error {
