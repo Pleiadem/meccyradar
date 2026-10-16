@@ -12,6 +12,13 @@ import (
 var assets embed.FS
 
 func main() {
+	release, alreadyRunning := acquireSingleInstance()
+	if alreadyRunning {
+		activateExistingWindow()
+		return
+	}
+	defer release()
+
 	// Create an instance of the app structure
 	app := NewApp()
 

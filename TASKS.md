@@ -13,12 +13,12 @@
 
 ## 阶段二：客户端状态和本地会话
 
-- [ ] 创建 `internal/config`。
-- [ ] 抽象 `CredentialStore`。
-- [ ] Windows 使用 DPAPI，Mac 开发使用 Keychain 或测试实现。
-- [ ] 保存、读取、清除卡密会话。
-- [ ] 区分首次手动登录和缓存自动登录。
-- [ ] 增加 Windows 单实例 Mutex 和已有窗口唤回。
+- [x] 创建 `internal/config`。
+- [x] 抽象 `CredentialStore`。
+- [x] Windows 使用 DPAPI，Mac 开发使用 Keychain 或测试实现。
+- [x] 保存、读取、清除卡密会话。
+- [x] 区分首次手动登录和缓存自动登录。
+- [x] 增加 Windows 单实例 Mutex 和已有窗口唤回。
 
 验证：会话可保存、读取、清除；重复启动不创建第二个实例。
 
