@@ -24,15 +24,15 @@
 
 ## 阶段三：管理端鉴权客户端
 
-- [ ] 创建 `internal/auth`。
-- [ ] 管理端 URL 通过构建配置或环境配置注入，不写死服务器节点。
-- [ ] 实现 `POST /api/client/login`。
-- [ ] 解析卡密类型、到期时间、租约、shareBaseUrl 和结构化 FRP 配置。
-- [ ] 实现 HTTP 409 占线错误转译。
-- [ ] 实现 `POST /api/client/heartbeat`。
-- [ ] 实现 `POST /api/client/logout`。
-- [ ] 心跳失败、租约失效时通知主流程停止隧道。
-- [ ] 前端 DTO 脱敏，不返回 serverAddr、Token、remotePort。
+- [x] 创建 `internal/auth`。
+- [x] 管理端 URL 通过构建配置或环境配置注入，不写死服务器节点。
+- [x] 实现 `POST /api/client/login`。
+- [x] 解析卡密类型、到期时间、租约、shareBaseUrl 和结构化 FRP 配置。
+- [x] 实现 HTTP 409 占线错误转译。
+- [x] 实现 `POST /api/client/heartbeat`。
+- [x] 实现 `POST /api/client/logout`。
+- [x] 心跳失败、租约失效时通知主流程停止隧道。
+- [x] 前端 DTO 脱敏，不返回 serverAddr、Token、remotePort。
 
 验证：使用本地 Mock 管理端测试成功、过期、409、心跳失败和数据缺失。
 
