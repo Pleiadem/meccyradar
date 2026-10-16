@@ -1,4 +1,39 @@
-# README
+# MeccyRadar
+
+## 本地登录测试
+
+启动独立 Mock 管理端：
+
+```bash
+go run ./cmd/mockserver
+```
+
+默认配置：
+
+- 管理端：`http://127.0.0.1:18080`
+- 测试卡密：`CARD-1`
+- Mock 返回的 FRP 节点：`127.0.0.1:7000`
+
+另开终端启动客户端：
+
+```bash
+export MECCYRADAR_MANAGEMENT_URL=http://127.0.0.1:18080
+wails dev
+```
+
+然后在登录页输入：
+
+```text
+CARD-1
+```
+
+Mock 管理端只负责鉴权、心跳和租约；没有启动 FRPS 时，登录可以测试，但启动隧道会因节点不可用而失败。
+
+自定义地址或卡密：
+
+```bash
+go run ./cmd/mockserver -addr 127.0.0.1:18080 -card CARD-TEST
+```
 
 ## About
 

@@ -47,6 +47,21 @@ export MECCYRADAR_MANAGEMENT_URL=https://management.example.com
 
 ## 运行
 
+### 本地 Mock 登录测试
+
+```bash
+go run ./cmd/mockserver
+```
+
+默认测试卡密为 `CARD-1`，管理端地址为 `http://127.0.0.1:18080`。另开终端设置：
+
+```bash
+export MECCYRADAR_MANAGEMENT_URL=http://127.0.0.1:18080
+wails dev
+```
+
+登录页输入 `CARD-1`。该 Mock 不包含真实生产凭据；未启动 FRPS 时，只能验证登录、占线、登出和会话流程，隧道启动会失败。
+
 开发模式：
 
 ```bash

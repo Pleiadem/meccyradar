@@ -27,12 +27,14 @@ type Server struct {
 
 func New(cardKey string) *Server {
 	s := &Server{cardKey: cardKey, leaseID: "mock-lease", expireAtUnix: time.Now().Add(time.Hour).Unix(), leaseExpireUnix: time.Now().Add(30 * time.Second).Unix()}
-	s.httpServer = httptest.NewServer(http.HandlerFunc(s.handle))
+	s.httpServer = httptest.NewServer(s.Handler())
 	return s
 }
 
 func (s *Server) URL() string { return s.httpServer.URL }
 func (s *Server) Close()      { s.httpServer.Close() }
+
+func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.handle) }
 
 func (s *Server) SetHeartbeatFailure(failed bool) {
 	s.mu.Lock()
