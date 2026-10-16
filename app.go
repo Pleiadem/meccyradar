@@ -256,7 +256,6 @@ func (a *App) stopEngineFromMonitor() error {
 	a.mu.Lock()
 	engine := a.engine
 	a.engine = nil
-	a.lastStatus = "idle"
 	a.mu.Unlock()
 	if engine != nil && engine.Running() {
 		return engine.Stop()

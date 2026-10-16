@@ -63,3 +63,30 @@ func TestAppManualLoginDoesNotStartTunnelAndClearsSessionOnLogout(t *testing.T) 
 		t.Fatal("expected session to be cleared")
 	}
 }
+
+func TestAppRestoresCachedSessionAndStartsTunnel(t *testing.T) {
+	server := mockserver.New("CARD-3")
+	defer server.Close()
+	client, err := auth.NewClient(server.URL(), &http.Client{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := config.NewMemoryStore()
+	if err := store.Save(config.Session{CardKey: "CARD-3"}); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(appDependencies{client: client, store: store})
+	app.restoreCachedSession()
+	defer app.stopTunnel()
+	state := app.GetInitState()
+	if !state.Authenticated {
+		t.Fatal("cached session was not restored")
+	}
+	if app.engine == nil || app.monitor == nil {
+		t.Fatal("cached session did not start tunnel and monitoring")
+	}
+	login, _, _ := server.Counts()
+	if login != 1 {
+		t.Fatalf("expected one automatic login, got %d", login)
+	}
+}

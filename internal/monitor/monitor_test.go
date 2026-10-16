@@ -118,6 +118,49 @@ func TestMonitorStopsTunnelOnHeartbeatFailure(t *testing.T) {
 	}
 }
 
+func TestMonitorStopsTunnelWhenClientExpiryReachesZero(t *testing.T) {
+	expired := make(chan Event, 1)
+	stopped := make(chan error, 1)
+	monitor, err := New(Config{
+		ServerAddr:   "node.example",
+		ServerPort:   7000,
+		ExpireAtUnix: time.Now().Add(-time.Second).Unix(),
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("not reached")
+		},
+		Hooks: Hooks{
+			Emit: func(event Event) {
+				if event.Status == StatusExpired {
+					expired <- event
+				}
+			},
+			StopTunnel: func(err error) { stopped <- err },
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-expired:
+		if event.ExpiresIn != 0 {
+			t.Fatalf("expected zero remaining time, got %d", event.ExpiresIn)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expiry event was not emitted")
+	}
+	select {
+	case err := <-stopped:
+		if err == nil {
+			t.Fatal("expected expiry stop error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expiry did not request tunnel stop")
+	}
+}
+
 func TestMonitorRejectsMissingExpiry(t *testing.T) {
 	if _, err := New(Config{ServerAddr: "node.example", ServerPort: 7000}); err == nil {
 		t.Fatal("expected missing expiry error")
