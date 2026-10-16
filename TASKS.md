@@ -103,7 +103,7 @@
 - [x] 完成 TCP/HTTP FRP 实际连接测试（本机 FRPS v0.71.0 数据面联调）。
 - [ ] 完成 Windows 10/11 真机测试。
 - [ ] 配置 Windows WebView2 策略并测试离线/国内网络场景。
-- [ ] 生成绿色版 EXE，必要时使用 `wails build -clean -platform windows/amd64 -upx`。
+- [x] 生成 Windows x64 绿色版 EXE（已完成交叉构建；Windows 真机验收仍待完成）。
 - [ ] 检查 EXE 启动、单实例、窗口唤回、剪贴板、网络和退出清理。
 
 最终验收命令：
