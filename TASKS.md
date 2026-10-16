@@ -66,15 +66,15 @@
 
 ## 阶段六：Wails API 和链接
 
-- [ ] 实现 `GetInitState()`。
-- [ ] 实现 `LoginByCard()`。
-- [ ] 实现 `StartTunnel()`。
-- [ ] 实现 `StopTunnel()`。
-- [ ] 实现 `CopyShareLink(password string) error`。
-- [ ] 实现 `Logout()`。
-- [ ] 固定查找代理名 `radar_tcp`。
-- [ ] 使用 Go `url.QueryEscape` 编码地址和密码。
-- [ ] 只写系统剪贴板，不把完整链接返回给 React。
+- [x] 实现 `GetInitState()`。
+- [x] 实现 `LoginByCard()`。
+- [x] 实现 `StartTunnel()`。
+- [x] 实现 `StopTunnel()`。
+- [x] 实现 `CopyShareLink(password string) error`。
+- [x] 实现 `Logout()`。
+- [x] 固定查找代理名 `radar_tcp`。
+- [x] 使用 Go `url.QueryEscape` 编码地址和密码。
+- [x] 只写系统剪贴板，不把完整链接返回给 React。
 
 验证：输出严格包含 `%3A`，React 调用结果不包含完整链接。
 
