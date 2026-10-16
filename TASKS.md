@@ -38,16 +38,16 @@
 
 ## 阶段四：内嵌 FRP 引擎
 
-- [ ] 创建 `internal/frpengine`。
-- [ ] 使用 `github.com/fatedier/frp/client`。
-- [ ] 使用 `source.NewConfigSource()` 和 `source.NewAggregator()`。
-- [ ] 在内存中创建 `v1.ClientCommonConfig`。
-- [ ] 组装 TCP `v1.TCPProxyConfig`。
-- [ ] 组装 HTTP `v1.HTTPProxyConfig`。
-- [ ] HTTP 必须配置 `customDomains` 或 `subdomain`。
-- [ ] 保留后续 `v1.ProxyConfigurer` 扩展入口。
-- [ ] 实现 Start、Stop、Running 状态。
-- [ ] 接入 FRP 全局日志 Writer，并恢复旧 Logger，避免污染其他模块。
+- [x] 创建 `internal/frpengine`。
+- [x] 使用 `github.com/fatedier/frp/client`。
+- [x] 使用 `source.NewConfigSource()` 和 `source.NewAggregator()`。
+- [x] 在内存中创建 `v1.ClientCommonConfig`。
+- [x] 组装 TCP `v1.TCPProxyConfig`。
+- [x] 组装 HTTP `v1.HTTPProxyConfig`。
+- [x] HTTP 必须配置 `customDomains` 或 `subdomain`。
+- [x] 保留后续 `v1.ProxyConfigurer` 扩展入口。
+- [x] 实现 Start、Stop、Running 状态。
+- [x] 接入 FRP 全局日志 Writer，并恢复旧 Logger，避免污染其他模块。
 
 验证：Mock 或真实测试 FRPS 下 TCP、HTTP 隧道启动和停止；非法配置返回明确错误。
 
