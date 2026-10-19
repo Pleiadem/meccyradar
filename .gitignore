@@ -1,7 +1,9 @@
 build/bin
 node_modules
 frontend/dist
+frontend/wailsjs/go/
 *.exe
 .env
 .env.*
 !.env.example
+.DS_Store

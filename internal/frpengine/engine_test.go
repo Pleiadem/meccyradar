@@ -22,8 +22,17 @@ func TestBuildConfigCreatesTCPAndHTTPProxyConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if common.ServerAddr != "node.example" || common.ServerPort != 7000 || common.Auth.Token != "[REDACTED]" {
+	if common.ServerAddr != "node.example" || common.ServerPort != 7000 {
 		t.Fatalf("unexpected common config: %+v", common)
+	}
+	// The panel authenticates via the plugin, which reads metadata["token"].
+	// auth.token must stay empty: a per-user token there fails the server's own
+	// global token check ("token in login doesn't match token from configuration").
+	if common.Auth.Token != "" || common.Auth.Method != "" {
+		t.Fatalf("auth token must not be set, got method=%q token set=%v", common.Auth.Method, common.Auth.Token != "")
+	}
+	if common.Metadatas["token"] != "[REDACTED]" {
+		t.Fatalf("metadata token missing, got %+v", common.Metadatas)
 	}
 	if len(proxies) != 2 {
 		t.Fatalf("expected two proxies, got %d", len(proxies))

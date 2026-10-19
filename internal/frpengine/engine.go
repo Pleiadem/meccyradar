@@ -200,10 +200,13 @@ func buildConfig(config auth.FRPConfig) (*v1.ClientCommonConfig, []v1.ProxyConfi
 		ServerPort:    config.ServerPort,
 		User:          config.User,
 		LoginFailExit: &loginFailExit,
-		Auth: v1.AuthClientConfig{
-			Method: v1.AuthMethodToken,
-			Token:  config.Token,
-		},
+		// This management panel authenticates entirely through the FRP plugin,
+		// which reads content.Metas["token"]. Sending the token as auth.token
+		// instead is rejected twice over: the plugin sees an empty metadata token
+		// ("用户名或token不能为空"), and the server's own global token check does not
+		// recognise a per-user token ("token in login doesn't match token from
+		// configuration"). The per-user credential must travel as metadata only.
+		Metadatas: map[string]string{"token": config.Token},
 	}
 	proxies := make([]v1.ProxyConfigurer, 0, len(config.Proxies))
 	for _, proxy := range config.Proxies {
