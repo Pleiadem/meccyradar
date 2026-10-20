@@ -15,7 +15,7 @@ type localProtector struct{ gcm cipher.AEAD }
 
 func NewPlatformProtector(serviceName string) (Protector, error) {
 	if serviceName == "" {
-		return nil, errors.New("service name is required")
+		return nil, errors.New("缺少服务名称")
 	}
 	seed := sha256.Sum256([]byte("meccyradar-development-protector:" + serviceName))
 	block, err := aes.NewCipher(seed[:])
@@ -39,7 +39,7 @@ func (p *localProtector) Protect(plain []byte) ([]byte, error) {
 
 func (p *localProtector) Unprotect(protected []byte) ([]byte, error) {
 	if len(protected) < p.gcm.NonceSize() {
-		return nil, errors.New("invalid protected session")
+		return nil, errors.New("本地会话数据无效")
 	}
 	nonce, ciphertext := protected[:p.gcm.NonceSize()], protected[p.gcm.NonceSize():]
 	return p.gcm.Open(nil, nonce, ciphertext, nil)

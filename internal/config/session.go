@@ -11,7 +11,7 @@ import (
 const defaultServiceName = "meccyradar"
 
 var (
-	ErrEmptyCardKey    = errors.New("card key is required")
+	ErrEmptyCardKey    = errors.New("请输入卡密")
 	ErrSessionNotFound = os.ErrNotExist
 )
 
@@ -38,10 +38,10 @@ type FileStore struct {
 
 func NewFileStore(path string, protector Protector) (*FileStore, error) {
 	if path == "" {
-		return nil, errors.New("session path is required")
+		return nil, errors.New("缺少会话文件路径")
 	}
 	if protector == nil {
-		return nil, errors.New("session protector is required")
+		return nil, errors.New("缺少会话保护器")
 	}
 	return &FileStore{path: path, protector: protector}, nil
 }
@@ -98,14 +98,14 @@ func (s *FileStore) Load() (Session, error) {
 	}
 	plain, err := s.protector.Unprotect(protected)
 	if err != nil {
-		return Session{}, errors.New("session cannot be decrypted")
+		return Session{}, errors.New("本地会话无法解密")
 	}
 	var session Session
 	if err := json.Unmarshal(plain, &session); err != nil {
-		return Session{}, errors.New("session is invalid")
+		return Session{}, errors.New("本地会话无效")
 	}
 	if session.CardKey == "" {
-		return Session{}, errors.New("session card key is empty")
+		return Session{}, errors.New("本地会话中的卡密为空")
 	}
 	return session, nil
 }

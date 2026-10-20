@@ -28,8 +28,8 @@ const (
 )
 
 var (
-	errNotAuthenticated  = errors.New("not authenticated")
-	errRadarProxyMissing = errors.New("radar_tcp proxy is not configured")
+	errNotAuthenticated  = errors.New("尚未登录")
+	errRadarProxyMissing = errors.New("未配置 radar_tcp 代理")
 )
 
 type InitStateDTO struct {
@@ -156,7 +156,7 @@ func (a *App) GetInitState() InitStateDTO {
 
 func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	if strings.TrimSpace(cardKey) == "" {
-		return AuthResultDTO{}, errors.New("card key is required")
+		return AuthResultDTO{}, errors.New("请输入卡密")
 	}
 	a.mu.Lock()
 	client, store, initErr := a.deps.client, a.deps.store, a.initErr
@@ -165,7 +165,7 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 		return AuthResultDTO{}, initErr
 	}
 	if client == nil || store == nil {
-		return AuthResultDTO{}, errors.New("app dependencies are not configured")
+		return AuthResultDTO{}, errors.New("应用依赖未配置")
 	}
 	data, err := client.Login(context.Background(), cardKey)
 	if err != nil {
@@ -303,7 +303,7 @@ func (a *App) CopyShareLink(password string) error {
 		return err
 	}
 	if clipboard == nil {
-		return errors.New("clipboard is not available")
+		return errors.New("剪贴板不可用")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -374,10 +374,10 @@ func findRadarProxy(proxies []auth.Proxy) (auth.Proxy, bool) {
 
 func buildShareLink(baseURL, serverAddr string, remotePort int, password string) (string, error) {
 	if strings.TrimSpace(baseURL) == "" || strings.TrimSpace(serverAddr) == "" {
-		return "", errors.New("share link configuration is incomplete")
+		return "", errors.New("分享链接配置不完整")
 	}
 	if remotePort < 1 || remotePort > 65535 {
-		return "", errors.New("radar remote port is invalid")
+		return "", errors.New("雷达远程端口无效")
 	}
 	base := strings.TrimRight(baseURL, "?")
 	separator := "?"

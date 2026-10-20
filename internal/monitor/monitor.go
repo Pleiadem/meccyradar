@@ -64,7 +64,7 @@ type Monitor struct {
 
 func New(cfg Config) (*Monitor, error) {
 	if cfg.ServerAddr == "" || cfg.ServerPort < 1 || cfg.ServerPort > 65535 {
-		return nil, errors.New("monitor server address and port are required")
+		return nil, errors.New("缺少服务器地址或端口")
 	}
 	if cfg.LocalAddr == "" {
 		cfg.LocalAddr = "127.0.0.1:13133"
@@ -80,7 +80,7 @@ func New(cfg Config) (*Monitor, error) {
 		cfg.DialContext = dialer.DialContext
 	}
 	if cfg.ExpireAtUnix <= 0 {
-		return nil, errors.New("monitor expiry time is required")
+		return nil, errors.New("缺少到期时间")
 	}
 	return &Monitor{cfg: cfg}, nil
 }
@@ -89,7 +89,7 @@ func (m *Monitor) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.running {
-		return errors.New("monitor is already running")
+		return errors.New("监控已在运行")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
@@ -103,7 +103,7 @@ func (m *Monitor) Stop() error {
 	m.mu.Lock()
 	if !m.running {
 		m.mu.Unlock()
-		return errors.New("monitor is not running")
+		return errors.New("监控未运行")
 	}
 	cancel, done := m.cancel, m.done
 	m.mu.Unlock()
@@ -129,7 +129,7 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 
 	m.emit(Event{Kind: "tunnel:status", Status: StatusConnecting})
 	if m.expired() {
-		m.expire(errors.New("authorization expired"))
+		m.expire(errors.New("授权已过期"))
 		return
 	}
 	m.measurePing(ctx)
@@ -151,7 +151,7 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 			return
 		case <-heartbeatTicker.C:
 			if m.expired() {
-				m.expire(errors.New("authorization expired"))
+				m.expire(errors.New("授权已过期"))
 				return
 			}
 			if !m.heartbeat(ctx) {
@@ -161,7 +161,7 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 			m.probePort(ctx)
 		case <-expiryTicker.C:
 			if m.expired() {
-				m.expire(errors.New("authorization expired"))
+				m.expire(errors.New("授权已过期"))
 				return
 			}
 			m.emit(Event{Kind: "tunnel:status", Status: StatusConnected, ExpiresIn: m.expiresIn()})

@@ -13,7 +13,7 @@ type windowsProtector struct{}
 
 func NewPlatformProtector(serviceName string) (Protector, error) {
 	if serviceName == "" {
-		return nil, errors.New("service name is required")
+		return nil, errors.New("缺少服务名称")
 	}
 	return windowsProtector{}, nil
 }

@@ -18,8 +18,8 @@ import (
 )
 
 var (
-	ErrAlreadyRunning = errors.New("frp engine is already running")
-	ErrNotRunning     = errors.New("frp engine is not running")
+	ErrAlreadyRunning = errors.New("FRP 引擎已在运行")
+	ErrNotRunning     = errors.New("FRP 引擎未运行")
 )
 
 type LogFunc func(line string)
@@ -62,7 +62,7 @@ func (e *Engine) Start() error {
 	}
 	configSource := source.NewConfigSource()
 	if err := configSource.ReplaceAll(proxies, nil); err != nil {
-		return fmt.Errorf("load FRP proxy configuration: %w", err)
+		return fmt.Errorf("加载 FRP 代理配置失败：%w", err)
 	}
 	service, err := frpclient.NewService(frpclient.ServiceOptions{
 		Common:                 common,
@@ -70,7 +70,7 @@ func (e *Engine) Start() error {
 		UnsafeFeatures:         &security.UnsafeFeatures{},
 	})
 	if err != nil {
-		return fmt.Errorf("create FRP service: %w", err)
+		return fmt.Errorf("创建 FRP 服务失败：%w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -151,40 +151,40 @@ func redactLogLine(line string, secrets []string) string {
 
 func validateConfig(config auth.FRPConfig) error {
 	if strings.TrimSpace(config.ServerAddr) == "" {
-		return errors.New("FRP server address is required")
+		return errors.New("请填写 FRP 服务器地址")
 	}
 	if net.ParseIP(config.ServerAddr) == nil && strings.ContainsAny(config.ServerAddr, "/\\ ") {
-		return errors.New("FRP server address is invalid")
+		return errors.New("FRP 服务器地址无效")
 	}
 	if config.ServerPort < 1 || config.ServerPort > 65535 {
-		return errors.New("FRP server port must be between 1 and 65535")
+		return errors.New("FRP 服务器端口必须在 1 到 65535 之间")
 	}
 	if strings.TrimSpace(config.Token) == "" {
-		return errors.New("FRP token is required")
+		return errors.New("缺少 FRP token")
 	}
 	if len(config.Proxies) == 0 {
-		return errors.New("at least one FRP proxy is required")
+		return errors.New("至少需要一个 FRP 代理")
 	}
 	seen := make(map[string]struct{}, len(config.Proxies))
 	for _, proxy := range config.Proxies {
 		if _, ok := seen[proxy.Name]; ok || strings.TrimSpace(proxy.Name) == "" {
-			return errors.New("FRP proxy names must be unique and non-empty")
+			return errors.New("FRP 代理名称必须唯一且非空")
 		}
 		seen[proxy.Name] = struct{}{}
 		if proxy.LocalPort < 1 || proxy.LocalPort > 65535 {
-			return fmt.Errorf("proxy %q local port must be between 1 and 65535", proxy.Name)
+			return fmt.Errorf("代理 %q 的本地端口必须在 1 到 65535 之间", proxy.Name)
 		}
 		switch proxy.Type {
 		case "tcp":
 			if proxy.RemotePort < 1 || proxy.RemotePort > 65535 {
-				return fmt.Errorf("proxy %q remote port must be between 1 and 65535", proxy.Name)
+				return fmt.Errorf("代理 %q 的远程端口必须在 1 到 65535 之间", proxy.Name)
 			}
 		case "http":
 			if len(proxy.CustomDomains) == 0 && strings.TrimSpace(proxy.Subdomain) == "" {
-				return fmt.Errorf("proxy %q HTTP requires customDomains or subdomain", proxy.Name)
+				return fmt.Errorf("代理 %q 的 HTTP 类型需要 customDomains 或 subdomain", proxy.Name)
 			}
 		default:
-			return fmt.Errorf("proxy %q uses unsupported type %q", proxy.Name, proxy.Type)
+			return fmt.Errorf("代理 %q 使用了不支持的类型 %q", proxy.Name, proxy.Type)
 		}
 	}
 	return nil

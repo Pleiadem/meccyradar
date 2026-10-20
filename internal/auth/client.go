@@ -14,8 +14,8 @@ import (
 	"time"
 )
 
-var ErrCardAlreadyOnline = errors.New("card already online")
-var ErrInvalidResponse = errors.New("invalid management response")
+var ErrCardAlreadyOnline = errors.New("该卡密已在线")
+var ErrInvalidResponse = errors.New("管理端返回的数据无法解析")
 
 type Client struct {
 	baseURL string
@@ -76,10 +76,10 @@ func (e *ConflictError) Error() string { return e.Message }
 func NewClient(rawBaseURL string, httpClient *http.Client) (*Client, error) {
 	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(rawBaseURL), "/"))
 	if err != nil || base.Scheme == "" || base.Host == "" {
-		return nil, errors.New("management base URL must include scheme and host")
+		return nil, errors.New("管理端地址必须包含协议和主机名")
 	}
 	if base.Scheme != "https" && base.Hostname() != "127.0.0.1" && base.Hostname() != "localhost" {
-		return nil, errors.New("management URL must use HTTPS outside localhost")
+		return nil, errors.New("非本机地址的管理端必须使用 HTTPS")
 	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -89,7 +89,7 @@ func NewClient(rawBaseURL string, httpClient *http.Client) (*Client, error) {
 
 func (c *Client) Login(ctx context.Context, cardKey string) (AuthData, error) {
 	if strings.TrimSpace(cardKey) == "" {
-		return AuthData{}, errors.New("card key is required")
+		return AuthData{}, errors.New("请输入卡密")
 	}
 	var out AuthData
 	if err := c.doJSON(ctx, http.MethodPost, "/api/client/login", loginRequest{CardKey: cardKey}, &out); err != nil {
@@ -103,7 +103,7 @@ func (c *Client) Login(ctx context.Context, cardKey string) (AuthData, error) {
 
 func (c *Client) Heartbeat(ctx context.Context, leaseID string) error {
 	if strings.TrimSpace(leaseID) == "" {
-		return errors.New("lease ID is required")
+		return errors.New("缺少租约 ID")
 	}
 	return c.doJSON(ctx, http.MethodPost, "/api/client/heartbeat", leaseRequest{LeaseID: leaseID}, &struct{}{})
 }
@@ -138,7 +138,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return &ConflictError{Message: "当前卡密已在其他设备运行，请先退出原设备"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("management request failed with HTTP %s", resp.Status)
+		return fmt.Errorf("管理端请求失败（HTTP %s）", resp.Status)
 	}
 	var envelope envelope
 	if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -163,7 +163,7 @@ func applicationError(code int, msg string) error {
 	if msg == "" {
 		msg = "management request rejected with code " + strconv.Itoa(code)
 	}
-	return fmt.Errorf("management request rejected: %s", msg)
+	return fmt.Errorf("管理端拒绝了请求：%s", msg)
 }
 
 func validateAuthData(data AuthData) error {
