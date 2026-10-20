@@ -10,16 +10,29 @@ go run ./cmd/mockserver
 
 默认配置：
 
-- 管理端：`http://127.0.0.1:18080`
-- 测试卡密：`CARD-1`
-- Mock 返回的 FRP 节点：`127.0.0.1:7000`
+- 管理端：`http://127.0.0.1:8766`（真实 RentForge）
+- 未设置 `MECCYRADAR_MANAGEMENT_URL` 时一律走这个默认值
 
-另开终端启动客户端：
+> 默认值**不是** mock。连到 mock 时任何真实卡密都会被判无效，
+> 报错会显示成"卡密无效"，很容易误判成卡密本身有问题。
+
+用真实服务时直接启动客户端即可：
+
+```bash
+wails dev
+```
+
+需要跑自测（mock）时，显式覆盖地址：
 
 ```bash
 export MECCYRADAR_MANAGEMENT_URL=http://127.0.0.1:18080
 wails dev
 ```
+
+Mock 的默认配置：
+
+- 测试卡密：`CARD-1`
+- Mock 返回的 FRP 节点：`127.0.0.1:7000`
 
 然后在登录页输入：
 

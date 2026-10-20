@@ -20,7 +20,10 @@ import (
 
 const (
 	managementURL        = "MECCYRADAR_MANAGEMENT_URL"
-	defaultManagementURL = "http://127.0.0.1:18080"
+	// 指向真实 RentForge。mock 服务器（cmd/mockserver）只用于自测，
+	// 需要时用 MECCYRADAR_MANAGEMENT_URL 显式覆盖，绝不能做默认值：
+	// 连到 mock 会把所有真实卡密都判成无效，报错还长得像卡密本身有问题。
+	defaultManagementURL = "http://127.0.0.1:8766"
 	radarProxyName       = "radar_tcp"
 )
 
@@ -80,12 +83,18 @@ type App struct {
 	initErr    error
 }
 
+// resolveManagementURL returns the management endpoint, defaulting to the real
+// RentForge service. The mock server must be opted into explicitly.
+func resolveManagementURL() string {
+	if value := strings.TrimSpace(os.Getenv(managementURL)); value != "" {
+		return value
+	}
+	return defaultManagementURL
+}
+
 func NewApp() *App {
 	store, storeErr := config.NewDefaultStore()
-	baseURL := os.Getenv(managementURL)
-	if strings.TrimSpace(baseURL) == "" {
-		baseURL = defaultManagementURL
-	}
+	baseURL := resolveManagementURL()
 	client, clientErr := auth.NewClient(baseURL, nil)
 	app := newApp(appDependencies{store: store, client: client, clipboard: runtime.ClipboardSetText})
 	if storeErr != nil {

@@ -53,7 +53,9 @@ export MECCYRADAR_MANAGEMENT_URL=https://management.example.com
 go run ./cmd/mockserver
 ```
 
-默认测试卡密为 `CARD-1`，管理端地址为 `http://127.0.0.1:18080`。另开终端设置：
+客户端默认管理端地址为 `http://127.0.0.1:8766`（真实 RentForge），无需额外配置。
+
+只在跑自测 mock 时才需要显式覆盖，mock 的测试卡密为 `CARD-1`：
 
 ```bash
 export MECCYRADAR_MANAGEMENT_URL=http://127.0.0.1:18080

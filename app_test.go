@@ -63,3 +63,21 @@ func TestLoginDTODoesNotExposeSensitiveFRPConfig(t *testing.T) {
 		t.Fatalf("sensitive data leaked into DTO representation: %q", text)
 	}
 }
+
+// ---------------------------------------------------------------- 管理端地址默认值
+
+func TestResolveManagementURLDefaultsToRealService(t *testing.T) {
+	// 默认必须指向真实 RentForge，而不是内置 mock：
+	// 连到 mock 时任何真卡都会被判无效，用户只会看到"卡密无效"这种误导性错误。
+	t.Setenv(managementURL, "")
+	if got := resolveManagementURL(); got != "http://127.0.0.1:8766" {
+		t.Fatalf("默认管理端地址应为真实服务，实际 %q", got)
+	}
+}
+
+func TestResolveManagementURLHonoursEnv(t *testing.T) {
+	t.Setenv(managementURL, " http://127.0.0.1:18080 ")
+	if got := resolveManagementURL(); got != "http://127.0.0.1:18080" {
+		t.Fatalf("显式设置应优先，实际 %q", got)
+	}
+}
