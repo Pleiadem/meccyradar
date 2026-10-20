@@ -26,7 +26,7 @@ npm ci --prefix frontend
 
 ## 配置
 
-管理端地址通过环境变量配置：
+服务端地址通过环境变量配置：
 
 ```bash
 export MECCYRADAR_MANAGEMENT_URL=https://management.example.com
@@ -34,7 +34,7 @@ export MECCYRADAR_MANAGEMENT_URL=https://management.example.com
 
 生产环境必须使用 HTTPS。仅 localhost/127.0.0.1 允许 HTTP，便于本地 Mock 测试。
 
-管理端需要提供：
+服务端需要提供：
 
 - `POST /api/client/login`
 - `POST /api/client/heartbeat`
@@ -53,7 +53,7 @@ export MECCYRADAR_MANAGEMENT_URL=https://management.example.com
 go run ./cmd/mockserver
 ```
 
-客户端默认管理端地址为 `http://127.0.0.1:8766`（真实 RentForge），无需额外配置。
+客户端默认服务端地址为 `http://127.0.0.1:8766`（真实 RentForge），无需额外配置。
 
 只在跑自测 mock 时才需要显式覆盖，mock 的测试卡密为 `CARD-1`：
 
@@ -102,7 +102,7 @@ make smoke
 专项测试覆盖：
 
 - 会话保存、读取和清除
-- 管理端登录、心跳、登出和 409 占线
+- 服务端登录、心跳、登出和 409 占线
 - FRP TCP/HTTP 内存配置
 - 非法 FRP 配置
 - 节点三次测速和本地端口监测
@@ -118,16 +118,16 @@ make smoke
 
 生产环境必须：
 
-- 使用 HTTPS 管理端
+- 使用 HTTPS 服务端
 - 不在前端或日志写入 Token、服务器地址和远程端口
-- 使用管理端动态下发配置
+- 使用服务端动态下发配置
 - 提供可用的 FRPS 节点和固定远程端口
 
 ## 已知限制
 
 1. 当前开发环境为 macOS，无法执行 Windows 测试二进制。
 2. Windows 10/11 真机、WebView2、DPAPI、Windows 单实例唤回和 Windows 剪贴板尚未完成实机验证。
-3. 真实管理端 URL、签名/Header 契约和生产 FRPS 节点尚未提供，只完成了配置化客户端契约和本地 Mock。
+3. 真实服务端 URL、签名/Header 契约和生产 FRPS 节点尚未提供，只完成了配置化客户端契约和本地 Mock。
 4. TCP/HTTP 真实 FRP 数据面已通过本机 FRPS v0.71.0 联调测试；生产 FRPS 节点尚未提供，生产网络行为仍需部署环境复验。
 5. 本地 Mock 的 FRP 节点地址仅用于契约测试，不能作为生产配置。
 6. 阶段八中的 Windows 真机相关项目仍待真实环境完成；自动登录、客户端/租约到期停止、本地 Mock 联调及本机 FRPS TCP/HTTP 数据面已有自动化测试。

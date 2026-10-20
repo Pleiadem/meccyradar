@@ -2,7 +2,7 @@
 
 ## 本地登录测试
 
-启动独立 Mock 管理端：
+启动独立 Mock 服务端：
 
 ```bash
 go run ./cmd/mockserver
@@ -10,7 +10,7 @@ go run ./cmd/mockserver
 
 默认配置：
 
-- 管理端：`http://127.0.0.1:8766`（真实 RentForge）
+- 服务端：`http://127.0.0.1:8766`（真实 RentForge）
 - 未设置 `MECCYRADAR_MANAGEMENT_URL` 时一律走这个默认值
 
 > 默认值**不是** mock。连到 mock 时任何真实卡密都会被判无效，
@@ -40,7 +40,7 @@ Mock 的默认配置：
 CARD-1
 ```
 
-Mock 管理端只负责鉴权、心跳和租约；没有启动 FRPS 时，登录可以测试，但启动隧道会因节点不可用而失败。
+Mock 服务端只负责鉴权、心跳和租约；没有启动 FRPS 时，登录可以测试，但启动隧道会因节点不可用而失败。
 
 自定义地址或卡密：
 

@@ -198,7 +198,7 @@ func (m *Monitor) heartbeat(ctx context.Context) bool {
 	}
 	if err := m.cfg.Heartbeater.Heartbeat(ctx, m.cfg.LeaseID); err != nil {
 		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "心跳失败"})
-		m.log("管理端心跳失败")
+		m.log("服务端心跳失败")
 		m.stopTunnel(err)
 		return false
 	}
