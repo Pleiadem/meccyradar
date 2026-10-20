@@ -223,12 +223,13 @@ func TestHeartbeatKeepsAuthorizationAliveBeyondLeaseWindow(t *testing.T) {
 	}
 }
 
-// 心跳失败说明会话真的失效，此时必须停隧道——不能无限续期。
+// 心跳失败说明会话真的失效，此时必须停隧道——这是"不做租约上限"之后
+// 防止无限续期的唯一兜底，所以必须直接断言 StopTunnel 被调用，
+// 而不是只看有没有发出事件。
 func TestHeartbeatFailureStillStopsTunnel(t *testing.T) {
 	base := time.Unix(1_000, 0)
 	hb := &fakeHeartbeat{err: errors.New("租约已过期")}
-	var mu sync.Mutex
-	var expired []Event
+	stopped := make(chan error, 1)
 
 	monitor, err := New(Config{
 		ServerAddr:        "node.example",
@@ -236,8 +237,9 @@ func TestHeartbeatFailureStillStopsTunnel(t *testing.T) {
 		LocalAddr:         "127.0.0.1:13133",
 		LeaseID:           "lease-1",
 		HeartbeatInterval: 10 * time.Millisecond,
-		LeaseExpireAtUnix: base.Add(time.Hour).Unix(),
-		ExpireAtUnix:      base.Add(30 * 24 * time.Hour).Unix(),
+		// 租约时间给足一年，确保停止只可能来自心跳失败，而不是租约到期
+		LeaseExpireAtUnix: base.Add(365 * 24 * time.Hour).Unix(),
+		ExpireAtUnix:      base.Add(730 * 24 * time.Hour).Unix(),
 		Heartbeater:       hb,
 		Now:               func() time.Time { return base },
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
@@ -245,16 +247,7 @@ func TestHeartbeatFailureStillStopsTunnel(t *testing.T) {
 			_ = peer.Close()
 			return conn, nil
 		},
-		Hooks: Hooks{
-			Emit: func(e Event) {
-				if e.Status == StatusError || e.Status == StatusExpired {
-					mu.Lock()
-					expired = append(expired, e)
-					mu.Unlock()
-				}
-			},
-			StopTunnel: func(error) {},
-		},
+		Hooks: Hooks{StopTunnel: func(err error) { stopped <- err }},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -262,11 +255,22 @@ func TestHeartbeatFailureStillStopsTunnel(t *testing.T) {
 	if err := monitor.Start(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(80 * time.Millisecond)
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(expired) == 0 {
-		t.Fatal("心跳失败必须产生错误事件并停止隧道")
+	select {
+	case stopErr := <-stopped:
+		if stopErr == nil {
+			t.Fatal("停止隧道时应带上传入的错误")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("心跳失败必须调用 StopTunnel（否则租约失效也不会断开，等于无限续期）")
+	}
+
+	// 监控自身也应退出
+	deadline := time.Now().Add(time.Second)
+	for monitor.Running() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if monitor.Running() {
+		t.Fatal("心跳失败后监控应停止运行")
 	}
 }
