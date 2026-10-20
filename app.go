@@ -25,6 +25,13 @@ const (
 	// 连到 mock 会把所有真实卡密都判成无效，报错还长得像卡密本身有问题。
 	defaultManagementURL = "http://127.0.0.1:8766"
 	radarProxyName       = "radar_tcp"
+	// 雷达分享域名固定为公网地址。
+	// 不能依赖服务端下发的 shareBaseUrl：RentForge 的 client_share_base_url
+	// 默认值就是管理端地址（http://127.0.0.1:8766/），照抄会让用户拿到
+	// 一个指向本机管理端的无效链接。
+	defaultRadarBaseURL = "http://radar.fastcheat.top/"
+	// 仅用于本地开发/mock 覆盖；填回环地址会被忽略。
+	radarBaseURLEnv = "MECCYRADAR_RADAR_BASE_URL"
 )
 
 var (
@@ -406,7 +413,8 @@ func (a *App) CopyShareLink(password string) error {
 	if strings.TrimSpace(password) == "" {
 		return errRadarPasswordRequired
 	}
-	link, err := buildShareLink(data.ShareBaseURL, data.FRPConfig.ServerAddr, proxy.RemotePort, password)
+	// 域名用固定的公网地址，不使用服务端下发的 shareBaseUrl。
+	link, err := buildShareLink(radarBaseURL(), data.FRPConfig.ServerAddr, proxy.RemotePort, password)
 	if err != nil {
 		return err
 	}
@@ -511,6 +519,35 @@ func buildShareLink(baseURL, serverAddr string, remotePort int, password string)
 		separator = "&"
 	}
 	return fmt.Sprintf("%s%sa=%s&k=%s", base, separator, url.QueryEscape(serverAddr+":"+strconv.Itoa(remotePort)), url.QueryEscape(password)), nil
+}
+
+// radarBaseURL 返回分享链接使用的域名。
+//
+// 固定为公网雷达域名；只有显式设置环境变量、且值不是回环地址时才允许覆盖
+// （供本地 mock 自测）。服务端下发的 shareBaseUrl 一律不采用。
+func radarBaseURL() string {
+	candidate := strings.TrimSpace(os.Getenv(radarBaseURLEnv))
+	if candidate == "" || isLoopbackURL(candidate) {
+		return defaultRadarBaseURL
+	}
+	if !strings.HasPrefix(candidate, "http://") && !strings.HasPrefix(candidate, "https://") {
+		return defaultRadarBaseURL
+	}
+	return candidate
+}
+
+// isLoopbackURL 判断是否是本机/回环地址，这类地址不能作为对外分享域名。
+func isLoopbackURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return true
+	}
+	host := strings.ToLower(parsed.Hostname())
+	switch host {
+	case "", "127.0.0.1", "localhost", "::1", "0.0.0.0":
+		return true
+	}
+	return false
 }
 
 func maxZero(value int64) int64 {

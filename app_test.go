@@ -40,7 +40,8 @@ func TestCopyShareLinkUsesOnlyRadarTCPProxy(t *testing.T) {
 	if err := app.CopyShareLink("pwd"); err != nil {
 		t.Fatal(err)
 	}
-	if copied != "http://radar.example/?a=node.example%3A8000&k=pwd" {
+	// 域名固定为公网雷达域名（不再取服务端下发的 shareBaseUrl）
+	if copied != "http://radar.fastcheat.top/?a=node.example%3A8000&k=pwd" {
 		t.Fatalf("unexpected copied link: %q", copied)
 	}
 }
