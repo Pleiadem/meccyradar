@@ -166,3 +166,107 @@ func TestMonitorRejectsMissingExpiry(t *testing.T) {
 		t.Fatal("expected missing expiry error")
 	}
 }
+
+// 租约 TTL（90 秒）是"心跳存活窗口"，不是授权期限。
+// 心跳成功即意味着租约被服务端续期，因此授权倒计时不应该拿旧租约到期时间
+// 作为上限，否则用户会在登录 90 秒后被误判"授权已到期"。
+func TestHeartbeatKeepsAuthorizationAliveBeyondLeaseWindow(t *testing.T) {
+	base := time.Unix(1_000, 0)
+	const cardExpiry = int64(30 * 24 * 3600) // 卡密 30 天
+
+	var mu sync.Mutex
+	var events []Event
+	var nowMu sync.Mutex
+	now := base
+	setNow := func(v time.Time) { nowMu.Lock(); now = v; nowMu.Unlock() }
+	clock := func() time.Time { nowMu.Lock(); defer nowMu.Unlock(); return now }
+
+	monitor, err := New(Config{
+		ServerAddr:        "node.example",
+		ServerPort:        7000,
+		LocalAddr:         "127.0.0.1:13133",
+		LeaseID:           "lease-1",
+		HeartbeatInterval: 10 * time.Millisecond,
+		// 登录响应里的租约到期时间：只有 90 秒
+		LeaseExpireAtUnix: base.Add(90 * time.Second).Unix(),
+		ExpireAtUnix:      base.Unix() + cardExpiry,
+		Heartbeater:       &fakeHeartbeat{},
+		Now:               clock,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			conn, peer := net.Pipe()
+			_ = peer.Close()
+			return conn, nil
+		},
+		Hooks: Hooks{Emit: func(e Event) { mu.Lock(); events = append(events, e); mu.Unlock() }},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = monitor.Stop() }()
+
+	// 心跳一直在成功，把时钟推过旧的租约到期点（90s）但远未到卡密到期
+	setNow(base.Add(5 * time.Minute))
+	time.Sleep(120 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, event := range events {
+		if event.Status == StatusExpired {
+			t.Fatalf("心跳正常时不应判定授权到期，但仍收到 expired 事件：%+v", event)
+		}
+	}
+	if !monitor.Running() {
+		t.Fatal("心跳正常时监控应继续运行，不应被停止")
+	}
+}
+
+// 心跳失败说明会话真的失效，此时必须停隧道——不能无限续期。
+func TestHeartbeatFailureStillStopsTunnel(t *testing.T) {
+	base := time.Unix(1_000, 0)
+	hb := &fakeHeartbeat{err: errors.New("租约已过期")}
+	var mu sync.Mutex
+	var expired []Event
+
+	monitor, err := New(Config{
+		ServerAddr:        "node.example",
+		ServerPort:        7000,
+		LocalAddr:         "127.0.0.1:13133",
+		LeaseID:           "lease-1",
+		HeartbeatInterval: 10 * time.Millisecond,
+		LeaseExpireAtUnix: base.Add(time.Hour).Unix(),
+		ExpireAtUnix:      base.Add(30 * 24 * time.Hour).Unix(),
+		Heartbeater:       hb,
+		Now:               func() time.Time { return base },
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			conn, peer := net.Pipe()
+			_ = peer.Close()
+			return conn, nil
+		},
+		Hooks: Hooks{
+			Emit: func(e Event) {
+				if e.Status == StatusError || e.Status == StatusExpired {
+					mu.Lock()
+					expired = append(expired, e)
+					mu.Unlock()
+				}
+			},
+			StopTunnel: func(error) {},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(expired) == 0 {
+		t.Fatal("心跳失败必须产生错误事件并停止隧道")
+	}
+}

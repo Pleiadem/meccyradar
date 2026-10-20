@@ -222,11 +222,15 @@ func (m *Monitor) expire(err error) {
 func (m *Monitor) expired() bool { return m.expiresIn() <= 0 }
 
 func (m *Monitor) expiresIn() int64 {
-	expiresAt := m.cfg.ExpireAtUnix
-	if m.cfg.LeaseExpireAtUnix > 0 && m.cfg.LeaseExpireAtUnix < expiresAt {
-		expiresAt = m.cfg.LeaseExpireAtUnix
-	}
-	return expiresAt - m.cfg.Now().Unix()
+	// 只以卡密到期时间为准。
+	//
+	// 租约到期时间（90 秒）是"多久没心跳就算掉线"的存活窗口，不是授权期限：
+	// 每次心跳成功服务端都会把租约续到 now+90s。之前把它取 min 进来，导致
+	// 登录 90 秒后必然判定"授权已到期"，与卡密的 30 天完全无关。
+	//
+	// 会话真实失效由心跳失败承担：heartbeat() 收到错误会停止隧道，
+	// 所以这里不做租约上限也不会无限续期。
+	return m.cfg.ExpireAtUnix - m.cfg.Now().Unix()
 }
 
 func (m *Monitor) stopTunnel(err error) {
