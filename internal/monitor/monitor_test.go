@@ -22,7 +22,7 @@ func (f *fakeHeartbeat) Heartbeat(context.Context, string) error {
 	return f.err
 }
 
-func TestMonitorMeasuresThreePingsAndProbesPort(t *testing.T) {
+func TestMonitorMeasuresPingsAndProbesPort(t *testing.T) {
 	base := time.Unix(1_000, 0)
 	var mu sync.Mutex
 	var events []Event
@@ -60,8 +60,9 @@ func TestMonitorMeasuresThreePingsAndProbesPort(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(dialCalls) != 4 {
-		t.Fatalf("expected three server dials and one port probe, got %d (%v)", len(dialCalls), dialCalls)
+	// pingSamples 次测速 + 1 次本地端口探测
+	if want := pingSamples + 1; len(dialCalls) != want {
+		t.Fatalf("expected %d dials (%d pings + 1 port probe), got %d (%v)", want, pingSamples, len(dialCalls), dialCalls)
 	}
 	if hb.calls != 1 {
 		t.Fatalf("expected one heartbeat, got %d", hb.calls)

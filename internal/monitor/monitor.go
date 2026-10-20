@@ -169,13 +169,22 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 	}
 }
 
+// pingSamples 每次连接后测速的样本数。
+const pingSamples = 5
+
+// measurePing 连测 pingSamples 次，并在每次成功后就上报"历史最低值"。
+//
+// 为什么每次都要上报而不是只报最终值：用户要的是"始终显示见过的最快延迟"，
+// 首次成功就要立刻有数字，之后只在更快时更新。若只发一次最终值，界面在
+// 整个测速期间都是空的，用户以为没在测。
 func (m *Monitor) measurePing(ctx context.Context) {
 	address := net.JoinHostPort(m.cfg.ServerAddr, fmt.Sprint(m.cfg.ServerPort))
 	var best int64
-	for i := 0; i < 3; i++ {
+	for i := 0; i < pingSamples; i++ {
 		started := m.cfg.Now()
 		conn, err := m.cfg.DialContext(ctx, "tcp", address)
 		if err != nil {
+			// 单次失败不影响其余样本，也不把已得到的最低值丢掉。
 			continue
 		}
 		_ = conn.Close()
@@ -183,13 +192,14 @@ func (m *Monitor) measurePing(ctx context.Context) {
 		if best == 0 || ms < best {
 			best = ms
 		}
+		// 每次成功测量都上报"历史最低值"：界面首次成功立即有数字，
+		// 之后即使本次更慢，显示的仍是见过的最快值（不会回退）。
+		m.emit(Event{Kind: "tunnel:status", Status: StatusConnected, PingMS: best, ExpiresIn: m.expiresIn()})
 	}
 	if best == 0 {
 		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "节点测速失败"})
 		m.log("节点 TCP 测速失败")
-		return
 	}
-	m.emit(Event{Kind: "tunnel:status", Status: StatusConnected, PingMS: best, ExpiresIn: m.expiresIn()})
 }
 
 func (m *Monitor) heartbeat(ctx context.Context) bool {

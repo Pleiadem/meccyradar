@@ -29,7 +29,8 @@ const (
 
 var (
 	errNotAuthenticated  = errors.New("尚未登录")
-	errRadarProxyMissing = errors.New("未配置 radar_tcp 代理")
+	errRadarProxyMissing      = errors.New("未配置 radar_tcp 代理")
+	errRadarPasswordRequired  = errors.New("请先填写雷达密码")
 )
 
 type InitStateDTO struct {
@@ -77,6 +78,8 @@ type App struct {
 	deps       appDependencies
 	authData   *auth.AuthData
 	cardKey    string
+	// 雷达密码：来自界面输入，随会话持久化，重启后自动带出。
+	radarPassword string
 	engine     *frpengine.Engine
 	monitor    *monitor.Monitor
 	lastStatus string
@@ -166,6 +169,49 @@ func (a *App) Quit() {
 	if ctx != nil {
 		runtime.Quit(ctx)
 	}
+}
+
+// loadSession 从凭据存储恢复卡密与雷达密码（供启动流程与测试使用）。
+func (a *App) loadSession() error {
+	a.mu.Lock()
+	store := a.deps.store
+	a.mu.Unlock()
+	if store == nil {
+		return errors.New("凭据存储不可用")
+	}
+	session, err := store.Load()
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.cardKey = session.CardKey
+	a.radarPassword = session.RadarPassword
+	a.mu.Unlock()
+	return nil
+}
+
+// RadarPassword 返回已保存的雷达密码，供界面初始化时回填。
+func (a *App) RadarPassword() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.radarPassword
+}
+
+// SaveRadarPassword 记住雷达密码，跨重启生效。
+func (a *App) SaveRadarPassword(password string) error {
+	a.mu.Lock()
+	a.radarPassword = password
+	cardKey, store := a.cardKey, a.deps.store
+	a.mu.Unlock()
+	if store == nil || cardKey == "" {
+		// 未登录时只留在内存，登录后由会话保存带走。
+		return nil
+	}
+	return store.Save(config.Session{
+		CardKey:       cardKey,
+		SavedAtUnix:   time.Now().Unix(),
+		RadarPassword: password,
+	})
 }
 
 func (a *App) restoreCachedSession() {
@@ -350,6 +396,16 @@ func (a *App) CopyShareLink(password string) error {
 	if !ok {
 		return errRadarProxyMissing
 	}
+	// 界面没传就退回已保存的密码；仍然为空则明确报错，
+	// 绝不生成 k= 这种缺参数的链接（用户拿到手是打不开的）。
+	if strings.TrimSpace(password) == "" {
+		a.mu.Lock()
+		password = a.radarPassword
+		a.mu.Unlock()
+	}
+	if strings.TrimSpace(password) == "" {
+		return errRadarPasswordRequired
+	}
 	link, err := buildShareLink(data.ShareBaseURL, data.FRPConfig.ServerAddr, proxy.RemotePort, password)
 	if err != nil {
 		return err
@@ -415,13 +471,31 @@ func (a *App) emitLog(message string) {
 	}
 }
 
+// findRadarProxy 选出用于雷达的 TCP 代理。
+//
+// 两种命名都要认：
+//   - radar_tcp：本地 mock（cmd/mockserver）用的名字
+//   - card_<card_id>_tcp：RentForge 真实下发的名字
+//
+// 只认 radar_tcp 会让真实卡密永远报"未配置 radar_tcp 代理"——这是
+// 线上一直复制不出链接的根因。同时仍然拒绝无关代理，避免复制出错误端口。
 func findRadarProxy(proxies []auth.Proxy) (auth.Proxy, bool) {
 	for _, proxy := range proxies {
-		if proxy.Name == radarProxyName {
+		if proxy.Name == radarProxyName && proxy.Type == "tcp" {
+			return proxy, true
+		}
+	}
+	for _, proxy := range proxies {
+		if proxy.Type == "tcp" && isCardProxyName(proxy.Name) {
 			return proxy, true
 		}
 	}
 	return auth.Proxy{}, false
+}
+
+// isCardProxyName 判断是否是 RentForge 的卡密代理名：card_<id>_tcp。
+func isCardProxyName(name string) bool {
+	return strings.HasPrefix(name, "card_") && strings.HasSuffix(name, "_tcp")
 }
 
 func buildShareLink(baseURL, serverAddr string, remotePort int, password string) (string, error) {
