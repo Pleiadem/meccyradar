@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -122,17 +123,20 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
-		return err
+		// url 解析失败的错误里可能带完整地址
+		log.Printf("management request build failed (base=%s): %v", c.baseURL, err)
+		return errors.New("服务端地址无效，请检查配置")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return c.redactTransportError(err)
 	}
 	defer resp.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
-		return err
+		log.Printf("management response read failed: %v", err)
+		return errors.New("服务端响应读取失败，请重试")
 	}
 	if resp.StatusCode == http.StatusConflict {
 		return &ConflictError{Message: "当前卡密已在其他设备运行，请先退出原设备"}
@@ -154,6 +158,22 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return ErrInvalidResponse
 	}
 	return nil
+}
+
+// redactTransportError 把底层网络错误转成用户可读的提示。
+//
+// net/http 的错误里带完整 URL（Post "http://host:port/path": dial tcp ...），
+// 直接返回给用户就泄露了服务端地址。完整错误只进日志，方便排查。
+func (c *Client) redactTransportError(err error) error {
+	log.Printf("management request to %s failed: %v", c.baseURL, err)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.New("连接服务端超时，请检查网络后重试")
+	case errors.Is(err, context.Canceled):
+		return errors.New("请求已取消")
+	default:
+		return errors.New("无法连接服务端，请检查网络或服务端地址")
+	}
 }
 
 func applicationError(code int, msg string) error {

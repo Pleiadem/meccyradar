@@ -113,7 +113,59 @@ func (a *App) startup(ctx context.Context) {
 	a.mu.Lock()
 	a.ctx = ctx
 	a.mu.Unlock()
+	// Windows 需要在启动时就挂上托盘：窗口关闭后是隐藏而非退出，
+	// 没有托盘就再也点不回来了。
+	a.startTray()
 	go a.restoreCachedSession()
+}
+
+// restoreWindow 把隐藏或最小化的窗口拉回前台。
+// 重复启动时由单实例回调触发：用户看到的是"唤回已经开着的那一个"，
+// 而不是新起一个进程去登录被拒。
+func (a *App) restoreWindow() {
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx == nil {
+		return
+	}
+	runtime.WindowShow(ctx)
+	runtime.WindowUnminimise(ctx)
+}
+
+// disconnect 停止隧道并释放服务端租约，但保留本地缓存的卡密，
+// 使下次启动仍能自动恢复。这和「退出登录」(Logout) 不同，后者会清凭据。
+func (a *App) disconnect() error {
+	stopErr := a.stopTunnel()
+
+	a.mu.Lock()
+	client, data := a.deps.client, a.authData
+	a.authData, a.cardKey, a.lastStatus = nil, "", "idle"
+	a.mu.Unlock()
+
+	if client != nil && data != nil && data.Session.LeaseID != "" {
+		if err := client.Logout(context.Background(), data.Session.LeaseID); err != nil && stopErr == nil {
+			return err
+		}
+	}
+	return stopErr
+}
+
+// shutdown 在应用真正退出时执行：断开连接、释放租约。
+// 关闭窗口只是隐藏（HideWindowOnClose），不会走到这里，隧道保持在线。
+func (a *App) shutdown(_ context.Context) {
+	_ = a.disconnect()
+}
+
+// Quit 供界面或托盘调用：先断开再退出，避免退出后卡密仍被占用。
+func (a *App) Quit() {
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	_ = a.disconnect()
+	if ctx != nil {
+		runtime.Quit(ctx)
+	}
 }
 
 func (a *App) restoreCachedSession() {

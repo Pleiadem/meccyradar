@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoginHeartbeatLogoutAndConflict(t *testing.T) {
@@ -78,5 +80,25 @@ func validAuthData() map[string]any {
 		"appName": "MeccyRadar", "shareBaseUrl": "http://radar.example/", "expireAtUnix": 1794736800, "expireAtStr": "2026-11-15 18:00",
 		"session":   map[string]any{"leaseId": "lease-1", "heartbeatInterval": 30, "leaseExpireAtUnix": 1794736830},
 		"frpConfig": map[string]any{"serverAddr": "node.example", "serverPort": 7000, "user": "user", "token": "secret-token", "proxies": []any{map[string]any{"name": "radar_tcp", "type": "tcp", "localIP": "127.0.0.1", "localPort": 13133, "remotePort": 8000}}},
+	}
+}
+
+// 连接失败时，用户可见的错误里不能出现服务端地址。
+func TestNetworkErrorsDoNotLeakServerAddress(t *testing.T) {
+	for _, base := range []string{"http://127.0.0.1:1", "http://localhost:1"} {
+		client, err := NewClient(base, &http.Client{Timeout: 2 * time.Second})
+		if err != nil {
+			t.Fatalf("NewClient(%s): %v", base, err)
+		}
+		_, err = client.Login(context.Background(), "CARD-1")
+		if err == nil {
+			t.Fatalf("NewClient(%s): 期望连接失败", base)
+		}
+		msg := err.Error()
+		for _, leak := range []string{"127.0.0.1", "localhost", "http://", ":1"} {
+			if strings.Contains(msg, leak) {
+				t.Fatalf("错误信息泄露了服务端地址 %q: %s", leak, msg)
+			}
+		}
 	}
 }
