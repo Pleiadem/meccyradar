@@ -20,3 +20,42 @@ body { margin: 0; }
 .form-input::placeholder { color: rgb(255 255 255 / 0.28); }
 .form-input:focus { border-color: rgb(255 255 255 / 0.55); background: rgb(255 255 255 / 0.07); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+
+/* ---------- Glass 风格 ----------
+   玻璃感需要"背后有东西可模糊"。纯黑背景上 backdrop-filter 看不出效果，
+   所以页面铺两个静态径向渐变色块作底，成本很低（不随动画重绘）。 */
+
+.glass-bg {
+  position: relative;
+  background-color: #07090c;
+  /* 两个静态光斑：一个冷色偏左上，一个暖色偏右下 */
+  background-image:
+    radial-gradient(60% 50% at 18% 12%, rgb(56 189 248 / 0.16), transparent 70%),
+    radial-gradient(55% 45% at 85% 88%, rgb(168 85 247 / 0.14), transparent 70%);
+  background-attachment: fixed;
+}
+
+/* 卡片/输入框/按钮共用的玻璃底：半透明 + 1px 半透明白边 + 12px 圆角 + 轻阴影 */
+.glass-panel {
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 12px;
+  background-color: rgb(255 255 255 / 0.055);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.28);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.glass-field {
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 12px;
+  background-color: rgb(255 255 255 / 0.045);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* 降级：不支持 backdrop-filter 时，模糊不存在，必须把底色加厚到足够不透明，
+   否则文字会直接压在背景光斑上，对比度不足读不清。 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass-panel { background-color: rgb(20 23 28 / 0.94); }
+  .glass-field { background-color: rgb(16 19 24 / 0.94); }
+}
