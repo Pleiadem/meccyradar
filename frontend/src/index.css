@@ -20,3 +20,21 @@ body { margin: 0; }
 .form-input::placeholder { color: rgb(255 255 255 / 0.28); }
 .form-input:focus { border-color: rgb(255 255 255 / 0.55); background: rgb(255 255 255 / 0.07); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+
+/* 状态光晕：用外发光把"隧道现在处于什么状态"透到面板外沿，
+   像灯带打在墙上。纯视觉反馈，不影响布局与命中区域。 */
+.status-glow { transition: box-shadow 900ms ease-in-out; }
+.status-glow-connected {
+  box-shadow: 0 0 40px rgb(110 231 183 / 0.15), 0 0 20px rgb(110 231 183 / 0.08);
+}
+.status-glow-connecting {
+  box-shadow: 0 0 40px rgb(252 211 77 / 0.15), 0 0 20px rgb(252 211 77 / 0.08);
+  animation: status-glow-pulse 2s ease-in-out infinite;
+}
+.status-glow-error {
+  box-shadow: 0 0 40px rgb(248 113 113 / 0.15), 0 0 20px rgb(248 113 113 / 0.08);
+}
+@keyframes status-glow-pulse {
+  0%, 100% { box-shadow: 0 0 40px rgb(252 211 77 / 0.10), 0 0 20px rgb(252 211 77 / 0.05); }
+  50% { box-shadow: 0 0 40px rgb(252 211 77 / 0.20), 0 0 20px rgb(252 211 77 / 0.12); }
+}
