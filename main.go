@@ -15,6 +15,10 @@ var assets embed.FS
 const singleInstanceID = "MeccyRadar.SingleInstance"
 
 func main() {
+	// Windows 精简版可能没有 WebView2 运行时。必须在 wails.Run 之前检查：
+	// 缺了它 Wails 只会抛一条英文技术错误，用户看到的是"双击没反应"。
+	ensureWebView2Runtime()
+
 	// Create an instance of the app structure
 	app := NewApp()
 
