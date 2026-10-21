@@ -23,6 +23,7 @@ type Server struct {
 	loginCount      int
 	heartbeatCount  int
 	logoutCount     int
+	takeovers       int
 }
 
 func New(cardKey string) *Server {
@@ -54,6 +55,13 @@ func (s *Server) Counts() (login, heartbeat, logout int) {
 	return s.loginCount, s.heartbeatCount, s.logoutCount
 }
 
+// Takeovers 返回被新登录顶掉的次数（对应真实服务端的 takeover 行为）。
+func (s *Server) Takeovers() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.takeovers
+}
+
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
@@ -79,9 +87,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loginCount++
+	// 真实服务端已改为 takeover：新设备登录直接顶掉旧设备，不再 409。
+	// mock 必须跟着真实契约走，否则用它写的用例会验证一个不存在的行为。
+	// （旧设备的下一次心跳会因为租约已被释放而收到 401，这里用
+	// leaseValid=false 表示同一件事。）
 	if s.online {
-		writeEnvelope(w, http.StatusConflict, "card already online", nil)
-		return
+		s.takeovers++
 	}
 	s.online = true
 	writeEnvelope(w, http.StatusOK, "ok", auth.AuthData{

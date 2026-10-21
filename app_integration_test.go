@@ -25,8 +25,12 @@ func TestMockManagementServerLoginLogoutAndConflict(t *testing.T) {
 	if data.Session.LeaseID == "" || data.FRPConfig.Proxies[0].RemotePort != 8000 {
 		t.Fatalf("unexpected auth data: %+v", data)
 	}
-	if _, err := client.Login(context.Background(), "CARD-1"); err == nil {
-		t.Fatal("expected second login conflict")
+	// 服务端已改为 takeover：第二次登录顶掉旧设备而不是 409。
+	if _, err := client.Login(context.Background(), "CARD-1"); err != nil {
+		t.Fatalf("第二次登录应顶掉旧设备而不是报错，实际 %v", err)
+	}
+	if server.Takeovers() != 1 {
+		t.Fatalf("应记录一次顶替，实际 %d", server.Takeovers())
 	}
 	if err := client.Logout(context.Background(), data.Session.LeaseID); err != nil {
 		t.Fatal(err)

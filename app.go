@@ -342,6 +342,43 @@ func (a *App) restoreCachedSession() {
 	a.authData = &data
 	a.mu.Unlock()
 	_ = a.startTunnel()
+	a.emitSessionRestored()
+}
+
+// emitSessionRestored 把"登录态已恢复"推给界面。
+//
+// 为什么必须有这个事件：restoreCachedSession 是在后台 goroutine 里跑的
+// （startup 用 go 调用），而前端只在挂载时取一次 GetInitState。
+// 自动登录在取完之后才成功的话，前端永远停在登录页 —— 用户以为没记住卡密，
+// 于是重新输一遍，而那次登录必然撞上 409（租约已被自动登录占住），
+// 表现就是"每次打开都要重打卡密，还进不去主界面"。
+func (a *App) emitSessionRestored() {
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx == nil {
+		return
+	}
+	runtime.EventsEmit(ctx, "session:restored", a.GetInitState())
+}
+
+// SavedCardKey 返回上次保存的卡密，供登录页预填。
+//
+// 自动登录失败时（网络不通、卡密被占用）界面会回到登录页，
+// 此时把卡密填好，用户只需要点一下"登录"，而不是重新手打一遍。
+// 读取走既有的凭据存储（Windows 上是 DPAPI 加密）。
+func (a *App) SavedCardKey() string {
+	a.mu.Lock()
+	store := a.deps.store
+	a.mu.Unlock()
+	if store == nil {
+		return ""
+	}
+	session, err := store.Load()
+	if err != nil {
+		return ""
+	}
+	return session.CardKey
 }
 
 func (a *App) GetInitState() InitStateDTO {

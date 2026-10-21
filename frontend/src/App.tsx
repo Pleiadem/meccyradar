@@ -35,6 +35,7 @@ type Backend = {
   SaveRadarPassword?: (password: string) => Promise<void>
   RemeasurePing?: () => Promise<void>
   CloseWindow?: () => void
+  SavedCardKey?: () => Promise<string>
   Logout?: () => Promise<void>
 }
 
@@ -67,7 +68,15 @@ export default function App() {
 
   useEffect(() => {
     if (backend?.GetInitState) {
-      void backend.GetInitState().then((state) => { if (state) setInit(state); setHydrated(true) }).catch(() => setHydrated(true))
+      void backend.GetInitState().then((state) => {
+        if (state) setInit(state)
+        setHydrated(true)
+        // 没进主界面说明自动登录没成（或还没跑完），把上次的卡密填好，
+        // 用户只需点一下登录，不用重新手打。
+        if (!state?.authenticated && backend?.SavedCardKey) {
+          void backend.SavedCardKey().then((saved) => { if (saved) setCardKey((current) => current || saved) }).catch(() => {})
+        }
+      }).catch(() => setHydrated(true))
     } else {
       setHydrated(true)
     }
@@ -91,6 +100,12 @@ export default function App() {
       const event = data[0] as PortStatus | undefined
       if (event) setPortOpen(event.open)
     })
+    // 自动登录是在后端后台完成的，前端挂载时可能还没结束。
+    // 没有这个事件的话，自动登录成功后界面仍然停在登录页。
+    const offRestored = runtime?.EventsOn?.('session:restored', (...data) => {
+      const state = data[0] as InitState | undefined
+      if (state) setInit(state)
+    })
     const offDiagnosis = runtime?.EventsOn?.('tunnel:diagnosis', (...data) => {
       const event = data[0] as Diagnosis | undefined
       if (event?.title) setDiagnosis(event)
@@ -103,6 +118,7 @@ export default function App() {
       window.clearTimeout(measureTimer.current)
       offStatus?.()
       offPort?.()
+      offRestored?.()
       offDiagnosis?.()
       offLog?.()
     }
