@@ -45,9 +45,8 @@ const (
 )
 
 var (
-	errNotAuthenticated      = errors.New("尚未登录")
-	errRadarProxyMissing     = errors.New("未配置 radar_tcp 代理")
-	errRadarPasswordRequired = errors.New("请先填写雷达密码")
+	errNotAuthenticated  = errors.New("尚未登录")
+	errRadarProxyMissing = errors.New("未配置 radar_tcp 代理")
 )
 
 type InitStateDTO struct {
@@ -543,15 +542,15 @@ func (a *App) CopyShareLink(password string) error {
 	if !ok {
 		return errRadarProxyMissing
 	}
-	// 界面没传就退回已保存的密码；仍然为空则明确报错，
-	// 绝不生成 k= 这种缺参数的链接（用户拿到手是打不开的）。
+	// 界面没传就退回已保存的密码。
+	//
+	// 仍然为空也照常生成链接（k= 留空）：雷达密码由用户自己决定填不填，
+	// 界面只在不足 8 位时把复制按钮置灰提示，不阻止复制。
+	// 之前这里直接报错，等于把"提示"做成了"拦截"。
 	if strings.TrimSpace(password) == "" {
 		a.mu.Lock()
 		password = a.radarPassword
 		a.mu.Unlock()
-	}
-	if strings.TrimSpace(password) == "" {
-		return errRadarPasswordRequired
 	}
 	// 域名用固定的公网地址，不使用服务端下发的 shareBaseUrl。
 	link, err := buildShareLink(radarBaseURL(), data.FRPConfig.ServerAddr, proxy.RemotePort, password)

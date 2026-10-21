@@ -97,3 +97,39 @@ func TestRadarBaseURLRejectsLoopbackOverride(t *testing.T) {
 		t.Fatalf("回环地址不得作为分享域名，得到 %q", got)
 	}
 }
+
+// 空密码也要能生成链接（k= 留空），由用户自己决定填不填。
+// 界面只在密码不足 8 位时把按钮置灰提示，但不再阻止复制。
+func TestShareLinkAllowsEmptyPassword(t *testing.T) {
+	var copied string
+	app := newApp(appDependencies{
+		store:     config.NewMemoryStore(),
+		clipboard: func(_ context.Context, text string) error { copied = text; return nil },
+	})
+	app.authData = rentForgePayload()
+
+	if err := app.CopyShareLink(""); err != nil {
+		t.Fatalf("空密码不应报错，实际 %v", err)
+	}
+	want := "http://radar.fastcheat.top/?a=43.138.163.188%3A13001&k="
+	if copied != want {
+		t.Fatalf("链接不符：\n得到 %q\n期望 %q", copied, want)
+	}
+}
+
+// 只有空白的密码等同于空密码。
+func TestShareLinkAllowsWhitespacePassword(t *testing.T) {
+	var copied string
+	app := newApp(appDependencies{
+		store:     config.NewMemoryStore(),
+		clipboard: func(_ context.Context, text string) error { copied = text; return nil },
+	})
+	app.authData = rentForgePayload()
+
+	if err := app.CopyShareLink("   "); err != nil {
+		t.Fatalf("纯空白密码不应报错，实际 %v", err)
+	}
+	if !strings.Contains(copied, "&k=") {
+		t.Fatalf("应生成带 k= 的链接，实际 %q", copied)
+	}
+}

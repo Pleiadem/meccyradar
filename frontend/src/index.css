@@ -20,37 +20,3 @@ body { margin: 0; }
 .form-input::placeholder { color: rgb(255 255 255 / 0.28); }
 .form-input:focus { border-color: rgb(255 255 255 / 0.55); background: rgb(255 255 255 / 0.07); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
-
-/* 状态光晕：向框内扩散，像灯带打在面板内壁上。
-   原来用外发光，在黑底上几乎看不见；改成 inset 后光晕落在面板内部，
-   对比度明显更高。不透明度提到 0.25~0.35、模糊半径提到 60px，
-   双层叠加让边缘更柔和。纯视觉反馈，不影响布局与命中区域。 */
-.status-glow { transition: box-shadow 900ms ease-in-out; }
-.status-glow-connected {
-  box-shadow:
-    inset 0 0 60px rgb(110 231 183 / 0.3),
-    inset 0 0 30px rgb(110 231 183 / 0.2);
-}
-.status-glow-connecting {
-  box-shadow:
-    inset 0 0 60px rgb(252 211 77 / 0.3),
-    inset 0 0 30px rgb(252 211 77 / 0.2);
-  animation: status-glow-pulse-inward 2s ease-in-out infinite;
-}
-.status-glow-error {
-  box-shadow:
-    inset 0 0 60px rgb(248 113 113 / 0.3),
-    inset 0 0 30px rgb(248 113 113 / 0.2);
-}
-@keyframes status-glow-pulse-inward {
-  0%, 100% {
-    box-shadow:
-      inset 0 0 50px rgb(252 211 77 / 0.22),
-      inset 0 0 25px rgb(252 211 77 / 0.15);
-  }
-  50% {
-    box-shadow:
-      inset 0 0 70px rgb(252 211 77 / 0.42),
-      inset 0 0 35px rgb(252 211 77 / 0.26);
-  }
-}
