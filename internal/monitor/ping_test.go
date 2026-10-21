@@ -146,3 +146,156 @@ func TestPingReportsFailureWhenAllSamplesFail(t *testing.T) {
 	}
 	mon.measurePing(context.Background())
 }
+
+// TestPingDoesNotReportFailureWhenSamplesAreZeroMS 复现线上误报：
+// 本机有 TUN/代理时握手可能本地完成，毫秒取整为 0（实测 31,0,0,0,0）。
+// 有成功样本就绝不能报"节点测速失败"。
+func TestPingDoesNotReportFailureWhenSamplesAreZeroMS(t *testing.T) {
+	latencies := []int64{31, 0, 0, 0, 0}
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	dialed := 0
+
+	var pings []int64
+	var failed bool
+	mon, err := New(Config{
+		ServerAddr:        "node.example",
+		ServerPort:        7000,
+		LocalAddr:         "127.0.0.1:13133",
+		HeartbeatInterval: time.Hour,
+		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
+		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
+		Now:               clock.Now,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			clock.advance(time.Duration(latencies[dialed]) * time.Millisecond)
+			dialed++
+			conn, peer := net.Pipe()
+			_ = peer.Close()
+			return conn, nil
+		},
+		Hooks: Hooks{
+			Emit: func(event Event) {
+				if event.Kind != "tunnel:status" {
+					return
+				}
+				if event.Status == StatusError && event.Message == "节点测速失败" {
+					failed = true
+				}
+				if event.PingMS > 0 {
+					pings = append(pings, event.PingMS)
+				}
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.measurePing(context.Background())
+
+	if failed {
+		t.Fatal("有成功样本时不得报『节点测速失败』")
+	}
+	if len(pings) != len(latencies) {
+		t.Fatalf("每次成功都应上报，实际 %v", pings)
+	}
+	if pings[0] != 31 {
+		t.Fatalf("首个样本应为 31ms，实际 %d", pings[0])
+	}
+	// 0ms 样本按"成功样本最小 1ms"处理，且始终取历史最低
+	for i := 1; i < len(pings); i++ {
+		if pings[i] != 1 {
+			t.Fatalf("0ms 样本应显示为 1ms 且不回退，实际序列 %v", pings)
+		}
+	}
+}
+
+// TestPingReportsFailureOnlyWhenEverySampleFails 全部失败才报失败。
+func TestPingReportsFailureOnlyWhenEverySampleFails(t *testing.T) {
+	failures := 0
+	mon, err := New(Config{
+		ServerAddr:        "node.example",
+		ServerPort:        7000,
+		LocalAddr:         "127.0.0.1:13133",
+		HeartbeatInterval: time.Hour,
+		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
+		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
+		Now:               time.Now,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, context.DeadlineExceeded
+		},
+		Hooks: Hooks{
+			Emit: func(event Event) {
+				if event.Kind == "tunnel:status" && event.Status == StatusError {
+					failures++
+				}
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.measurePing(context.Background())
+	if failures != 1 {
+		t.Fatalf("全部失败时应恰好报一次失败，实际 %d", failures)
+	}
+}
+
+// TestPingDisplaysAfterFirstFailureThenSuccess 首次失败后成功仍要显示。
+func TestPingDisplaysAfterFirstFailureThenSuccess(t *testing.T) {
+	latencies := []int64{0, 25, 20, 30, 22}
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	calls := 0
+
+	var pings []int64
+	mon, err := New(Config{
+		ServerAddr:        "node.example",
+		ServerPort:        7000,
+		LocalAddr:         "127.0.0.1:13133",
+		HeartbeatInterval: time.Hour,
+		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
+		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
+		Now:               clock.Now,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			idx := calls
+			calls++
+			if idx == 0 {
+				return nil, context.DeadlineExceeded
+			}
+			clock.advance(time.Duration(latencies[idx]) * time.Millisecond)
+			conn, peer := net.Pipe()
+			_ = peer.Close()
+			return conn, nil
+		},
+		Hooks: Hooks{
+			Emit: func(event Event) {
+				if event.Kind == "tunnel:status" && event.PingMS > 0 {
+					pings = append(pings, event.PingMS)
+				}
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.measurePing(context.Background())
+
+	want := []int64{25, 20, 20, 20}
+	if len(pings) != len(want) {
+		t.Fatalf("期望 %v，实际 %v", want, pings)
+	}
+	for i := range want {
+		if pings[i] != want[i] {
+			t.Fatalf("期望 %v，实际 %v", want, pings)
+		}
+	}
+}
+
+// TestPingUsesSeparateLongerDialTimeout ping 用独立超时（2s），
+// 端口探测仍是 500ms，两者语义不能混。
+func TestPingUsesSeparateLongerDialTimeout(t *testing.T) {
+	if pingDialTimeout != 2*time.Second {
+		t.Fatalf("ping 超时应为 2s，实际 %v", pingDialTimeout)
+	}
+	if probeDialTimeout != 500*time.Millisecond {
+		t.Fatalf("端口探测超时应保持 500ms，实际 %v", probeDialTimeout)
+	}
+}

@@ -49,9 +49,22 @@ type Config struct {
 	ExpireAtUnix      int64
 	Heartbeater       Heartbeater
 	DialContext       func(context.Context, string, string) (net.Conn, error)
-	Now               func() time.Time
-	Hooks             Hooks
+	// PingDialContext 单独给测速用：海外节点 500ms 常常不够，
+	// 但端口探测要的是"本地端口通不通"，必须保持短超时，两者不能混用。
+	// 留空时：若 DialContext 是外部注入的（测试/自定义）则沿用它，
+	// 否则用 pingDialTimeout 的默认 dialer。
+	PingDialContext func(context.Context, string, string) (net.Conn, error)
+	Now             func() time.Time
+	Hooks           Hooks
 }
+
+const (
+	// pingDialTimeout 节点测速的连接超时。
+	pingDialTimeout = 2 * time.Second
+	// probeDialTimeout 本地端口探测的超时：只判断本地端口是否可连，
+	// 保持短超时以免拖慢状态刷新。
+	probeDialTimeout = 500 * time.Millisecond
+)
 
 type Monitor struct {
 	cfg Config
@@ -75,9 +88,20 @@ func New(cfg Config) (*Monitor, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	customDial := cfg.DialContext
 	if cfg.DialContext == nil {
-		dialer := &net.Dialer{Timeout: 500 * time.Millisecond}
+		dialer := &net.Dialer{Timeout: probeDialTimeout}
 		cfg.DialContext = dialer.DialContext
+	}
+	if cfg.PingDialContext == nil {
+		if customDial != nil {
+			// 外部注入了 dialer（测试或自定义实现）：沿用同一个，
+			// 否则测试无法控制测速的连接行为。
+			cfg.PingDialContext = customDial
+		} else {
+			pingDialer := &net.Dialer{Timeout: pingDialTimeout}
+			cfg.PingDialContext = pingDialer.DialContext
+		}
 	}
 	if cfg.ExpireAtUnix <= 0 {
 		return nil, errors.New("缺少到期时间")
@@ -180,26 +204,47 @@ const pingSamples = 5
 func (m *Monitor) measurePing(ctx context.Context) {
 	address := net.JoinHostPort(m.cfg.ServerAddr, fmt.Sprint(m.cfg.ServerPort))
 	var best int64
+	// 用独立的 ok 标记"是否有过成功样本"。
+	// 不能用 best == 0 代替：本机开着 TUN/代理时握手可能本地完成，
+	// 取整后正好是 0ms，那样会把成功的测速误判成"节点测速失败"。
+	succeeded := false
 	for i := 0; i < pingSamples; i++ {
 		started := m.cfg.Now()
-		conn, err := m.cfg.DialContext(ctx, "tcp", address)
+		conn, err := m.cfg.PingDialContext(ctx, "tcp", address)
 		if err != nil {
 			// 单次失败不影响其余样本，也不把已得到的最低值丢掉。
 			continue
 		}
 		_ = conn.Close()
-		ms := m.cfg.Now().Sub(started).Milliseconds()
-		if best == 0 || ms < best {
+		ms := elapsedMillis(m.cfg.Now().Sub(started))
+		if !succeeded || ms < best {
 			best = ms
 		}
+		succeeded = true
 		// 每次成功测量都上报"历史最低值"：界面首次成功立即有数字，
 		// 之后即使本次更慢，显示的仍是见过的最快值（不会回退）。
 		m.emit(Event{Kind: "tunnel:status", Status: StatusConnected, PingMS: best, ExpiresIn: m.expiresIn()})
 	}
-	if best == 0 {
+	if !succeeded {
 		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "节点测速失败"})
 		m.log("节点 TCP 测速失败")
 	}
+}
+
+// elapsedMillis 把耗时换算成毫秒，向上取整，且成功样本最小为 1ms。
+//
+// 为什么不能直接 Milliseconds()：它向下取整，亚毫秒的握手会变成 0ms。
+// 0ms 在界面上既不可信，也会和"还没测到"混在一起，所以统一抬到 1ms。
+func elapsedMillis(d time.Duration) int64 {
+	micros := d.Microseconds()
+	if micros < 0 {
+		micros = 0
+	}
+	ms := (micros + 999) / 1000
+	if ms < 1 {
+		ms = 1
+	}
+	return ms
 }
 
 func (m *Monitor) heartbeat(ctx context.Context) bool {
