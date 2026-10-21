@@ -74,12 +74,31 @@ type ConflictError struct{ Message string }
 
 func (e *ConflictError) Error() string { return e.Message }
 
+// plainHTTPAllowedHosts 是允许明文 HTTP 的主机白名单。
+//
+// 默认规则是"非本机必须 HTTPS"：登录请求会带卡密，心跳会带租约 ID，
+// 明文传输等于把这些凭据暴露在链路上。这里只放行运维明确指定、且由
+// 我们自己控制的自建管理端。加条目之前先确认该链路是否可能被旁路监听，
+// 不要图省事往里塞域名。
+var plainHTTPAllowedHosts = map[string]bool{
+	"43.138.163.188": true,
+}
+
+// isPlainHTTPAllowedHost 判断该主机是否允许走明文 HTTP。
+func isPlainHTTPAllowedHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return plainHTTPAllowedHosts[host]
+}
+
 func NewClient(rawBaseURL string, httpClient *http.Client) (*Client, error) {
 	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(rawBaseURL), "/"))
 	if err != nil || base.Scheme == "" || base.Host == "" {
 		return nil, errors.New("服务端地址必须包含协议和主机名")
 	}
-	if base.Scheme != "https" && base.Hostname() != "127.0.0.1" && base.Hostname() != "localhost" {
+	if base.Scheme != "https" && !isPlainHTTPAllowedHost(base.Hostname()) {
 		return nil, errors.New("非本机地址的服务端必须使用 HTTPS")
 	}
 	if httpClient == nil {

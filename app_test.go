@@ -71,7 +71,7 @@ func TestResolveManagementURLDefaultsToRealService(t *testing.T) {
 	// 默认必须指向真实 RentForge，而不是内置 mock：
 	// 连到 mock 时任何真卡都会被判无效，用户只会看到"卡密无效"这种误导性错误。
 	t.Setenv(managementURL, "")
-	if got := resolveManagementURL(); got != "http://127.0.0.1:8766" {
+	if got := resolveManagementURL(); got != "http://43.138.163.188:10003/" {
 		t.Fatalf("默认服务端地址应为真实服务，实际 %q", got)
 	}
 }

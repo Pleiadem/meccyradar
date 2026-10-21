@@ -20,15 +20,14 @@ import (
 
 const (
 	managementURL = "MECCYRADAR_MANAGEMENT_URL"
-	// 指向真实 RentForge。mock 服务器（cmd/mockserver）只用于自测，
+	// 指向真实 RentForge 管理端。mock 服务器（cmd/mockserver）只用于自测，
 	// 需要时用 MECCYRADAR_MANAGEMENT_URL 显式覆盖，绝不能做默认值：
 	// 连到 mock 会把所有真实卡密都判成无效，报错还长得像卡密本身有问题。
-	defaultManagementURL = "http://127.0.0.1:8766"
+	defaultManagementURL = "http://43.138.163.188:10003/"
 	radarProxyName       = "radar_tcp"
 	// 雷达分享域名固定为公网地址。
 	// 不能依赖服务端下发的 shareBaseUrl：RentForge 的 client_share_base_url
-	// 默认值就是管理端地址（http://127.0.0.1:8766/），照抄会让用户拿到
-	// 一个指向本机管理端的无效链接。
+	// 默认值就是管理端地址，照抄会让用户拿到一个指向管理端的无效链接。
 	defaultRadarBaseURL = "http://radar.fastcheat.top/"
 	// 仅用于本地开发/mock 覆盖；填回环地址会被忽略。
 	radarBaseURLEnv = "MECCYRADAR_RADAR_BASE_URL"
