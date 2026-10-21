@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"meccyradar/internal/auth"
 	"meccyradar/internal/config"
+	"meccyradar/internal/monitor"
 )
 
 // RentForge 下发的代理名是 `card_<card_id>_tcp`，不是 `radar_tcp`。
@@ -155,4 +157,60 @@ func TestCopyShareLinkUsesStoredPasswordWhenArgumentEmpty(t *testing.T) {
 		t.Fatalf("应使用已保存的密码，实际 %q", copied)
 	}
 	_ = time.Now
+}
+
+// 隧道未运行时点击重测必须给出明确错误，而不是静默无反应。
+func TestRemeasurePingWithoutTunnelFails(t *testing.T) {
+	app := newApp(appDependencies{store: config.NewMemoryStore()})
+	err := app.RemeasurePing()
+	if err == nil {
+		t.Fatal("隧道未运行时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "隧道未运行") {
+		t.Fatalf("错误应说明隧道未运行，实际 %q", err.Error())
+	}
+}
+
+// 隧道运行时点击重测必须真的触发一轮测速。
+func TestRemeasurePingTriggersMeasurement(t *testing.T) {
+	app := newApp(appDependencies{store: config.NewMemoryStore()})
+
+	measured := make(chan int64, 32)
+	mon, err := monitor.New(monitor.Config{
+		ServerAddr:        "node.example",
+		ServerPort:        7000,
+		LocalAddr:         "127.0.0.1:13133",
+		HeartbeatInterval: time.Hour,
+		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
+		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			conn, peer := net.Pipe()
+			_ = peer.Close()
+			return conn, nil
+		},
+		Hooks: monitor.Hooks{
+			Emit: func(event monitor.Event) {
+				if event.Kind == "tunnel:status" && event.Status == "connected" {
+					select {
+					case measured <- event.PingMS:
+					default:
+					}
+				}
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.monitor = mon
+
+	if err := app.RemeasurePing(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-measured:
+		// 收到测速结果即证明重测被触发
+	case <-time.After(3 * time.Second):
+		t.Fatal("点击重测未触发测速")
+	}
 }

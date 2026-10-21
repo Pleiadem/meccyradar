@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -194,7 +196,7 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 }
 
 // pingSamples 每次连接后测速的样本数。
-const pingSamples = 5
+const pingSamples = 10
 
 // measurePing 连测 pingSamples 次，并在每次成功后就上报"历史最低值"。
 //
@@ -203,27 +205,28 @@ const pingSamples = 5
 // 整个测速期间都是空的，用户以为没在测。
 func (m *Monitor) measurePing(ctx context.Context) {
 	address := net.JoinHostPort(m.cfg.ServerAddr, fmt.Sprint(m.cfg.ServerPort))
-	var best int64
-	// 用独立的 ok 标记"是否有过成功样本"。
-	// 不能用 best == 0 代替：本机开着 TUN/代理时握手可能本地完成，
+	samples := make([]int64, 0, pingSamples)
+	// 用独立的标记判断"是否有过成功样本"。
+	// 不能用样本值 == 0 代替：本机开着 TUN/代理时握手可能本地完成，
 	// 取整后正好是 0ms，那样会把成功的测速误判成"节点测速失败"。
 	succeeded := false
 	for i := 0; i < pingSamples; i++ {
 		started := m.cfg.Now()
 		conn, err := m.cfg.PingDialContext(ctx, "tcp", address)
 		if err != nil {
-			// 单次失败不影响其余样本，也不把已得到的最低值丢掉。
+			// 单次失败不影响其余样本，也不丢弃已采集的样本。
 			continue
 		}
 		_ = conn.Close()
-		ms := elapsedMillis(m.cfg.Now().Sub(started))
-		if !succeeded || ms < best {
-			best = ms
-		}
+		samples = append(samples, durationMillis(m.cfg.Now().Sub(started)))
 		succeeded = true
-		// 每次成功测量都上报"历史最低值"：界面首次成功立即有数字，
-		// 之后即使本次更慢，显示的仍是见过的最快值（不会回退）。
-		m.emit(Event{Kind: "tunnel:status", Status: StatusConnected, PingMS: best, ExpiresIn: m.expiresIn()})
+		// 每次成功都更新显示：当前有效样本（去极值后）的平均值。
+		m.emit(Event{
+			Kind:      "tunnel:status",
+			Status:    StatusConnected,
+			PingMS:    trimmedAverageMillis(samples),
+			ExpiresIn: m.expiresIn(),
+		})
 	}
 	if !succeeded {
 		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "节点测速失败"})
@@ -231,20 +234,48 @@ func (m *Monitor) measurePing(ctx context.Context) {
 	}
 }
 
-// elapsedMillis 把耗时换算成毫秒，向上取整，且成功样本最小为 1ms。
+// MeasurePingNow 供界面"点击重测"调用，立即跑一轮测速。
+func (m *Monitor) MeasurePingNow(ctx context.Context) {
+	m.measurePing(ctx)
+}
+
+// durationMillis 把耗时换算为毫秒（四舍五入）。
 //
-// 为什么不能直接 Milliseconds()：它向下取整，亚毫秒的握手会变成 0ms。
-// 0ms 在界面上既不可信，也会和"还没测到"混在一起，所以统一抬到 1ms。
-func elapsedMillis(d time.Duration) int64 {
-	micros := d.Microseconds()
-	if micros < 0 {
-		micros = 0
+// 这里不设 1ms 下限：亚毫秒握手就是 0ms，硬抬到 1ms 会显示一个
+// 本地代理环境下永远不变的假数字。是否"测到了"由 succeeded 判断，
+// 与显示值无关。
+func durationMillis(d time.Duration) int64 {
+	if d < 0 {
+		d = 0
 	}
-	ms := (micros + 999) / 1000
-	if ms < 1 {
-		ms = 1
+	return int64(math.Round(float64(d) / float64(time.Millisecond)))
+}
+
+// trimmedAverageMillis 去掉 1 个最大值与 1 个最小值后取平均（四舍五入）。
+//
+// 去极值是为了滤掉偶发的一次慢握手（例如 100ms）把整体拉高。
+// 样本少于 3 个时无法同时去掉两头，先按全部样本取平均。
+func trimmedAverageMillis(values []int64) int64 {
+	if len(values) == 0 {
+		return 0
 	}
-	return ms
+	if len(values) < 3 {
+		return meanMillis(values)
+	}
+	sorted := append([]int64(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return meanMillis(sorted[1 : len(sorted)-1])
+}
+
+func meanMillis(values []int64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	var sum int64
+	for _, value := range values {
+		sum += value
+	}
+	return int64(math.Round(float64(sum) / float64(len(values))))
 }
 
 func (m *Monitor) heartbeat(ctx context.Context) bool {

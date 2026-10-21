@@ -427,6 +427,26 @@ func (a *App) CopyShareLink(password string) error {
 	return clipboard(ctx, link)
 }
 
+// RemeasurePing 供界面点击延迟数字时重新测速。
+//
+// 隧道没在跑就没有 monitor，此时明确报错而不是静默无反应 ——
+// 否则用户点了没变化会以为界面坏了。
+func (a *App) RemeasurePing() error {
+	a.mu.Lock()
+	mon, ctx := a.monitor, a.ctx
+	a.mu.Unlock()
+	if mon == nil {
+		return errors.New("隧道未运行，无法测速")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// 异步执行：测速要连 10 次，同步等待会卡住界面线程。
+	// 结果通过 tunnel:status 事件推给界面。
+	go mon.MeasurePingNow(ctx)
+	return nil
+}
+
 func (a *App) Logout() error {
 	_ = a.stopTunnel()
 	a.mu.Lock()
