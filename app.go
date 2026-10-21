@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/signal"
@@ -33,6 +34,13 @@ const (
 	defaultRadarBaseURL = "http://radar.fastcheat.top/"
 	// 仅用于本地开发/mock 覆盖；填回环地址会被忽略。
 	radarBaseURLEnv = "MECCYRADAR_RADAR_BASE_URL"
+	// leaseReleaseAttempts 释放租约的重试次数。
+	// 退出时网络抖一下就会漏掉 logout，租约要白占 90 秒（服务端 TTL），
+	// 期间用户重启客户端只会一直看到「已在其他设备运行」。
+	leaseReleaseAttempts = 2
+	// leaseReleaseTimeout 单次 logout 的超时。
+	// 不能太长：退出流程要等它，点「退出」卡十几秒比漏发一次更糟。
+	leaseReleaseTimeout = 3 * time.Second
 )
 
 var (
@@ -169,6 +177,8 @@ func (a *App) restoreWindow() {
 // disconnect 停止隧道并释放服务端租约，但保留本地缓存的卡密，
 // 使下次启动仍能自动恢复。这和「退出登录」(Logout) 不同，后者会清凭据。
 func (a *App) disconnect() error {
+	// 先停隧道并等它真正结束（monitor.Stop 会 <-done），
+	// 避免心跳在 logout 之后还发一次。
 	stopErr := a.stopTunnel()
 
 	a.mu.Lock()
@@ -176,18 +186,40 @@ func (a *App) disconnect() error {
 	a.authData, a.cardKey, a.lastStatus = nil, "", "idle"
 	a.mu.Unlock()
 
-	if client != nil && data != nil && data.Session.LeaseID != "" {
-		if err := client.Logout(context.Background(), data.Session.LeaseID); err != nil && stopErr == nil {
-			return err
-		}
+	if client == nil || data == nil || data.Session.LeaseID == "" {
+		return stopErr
 	}
-	return stopErr
+
+	leaseID := data.Session.LeaseID
+	var lastErr error
+	for attempt := 1; attempt <= leaseReleaseAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+		err := client.Logout(ctx, leaseID)
+		cancel()
+		if err == nil {
+			return stopErr
+		}
+		lastErr = err
+		a.logf("释放租约失败（第 %d/%d 次）：%v", attempt, leaseReleaseAttempts, err)
+	}
+	return lastErr
+}
+
+// logf 同时写界面日志与进程标准日志。
+//
+// 退出路径上的失败必须留下痕迹：界面马上就没了，只有标准日志能事后查。
+func (a *App) logf(format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
+	log.Printf("%s", message)
+	a.emitLog(message)
 }
 
 // shutdown 在应用真正退出时执行：断开连接、释放租约。
 // 关闭窗口只是隐藏（HideWindowOnClose），不会走到这里，隧道保持在线。
 func (a *App) shutdown(_ context.Context) {
-	_ = a.disconnect()
+	if err := a.disconnect(); err != nil {
+		a.logf("退出时释放租约失败，服务端将在 90 秒后自动回收：%v", err)
+	}
 }
 
 // hideWindow 只隐藏窗口，进程与隧道都继续运行。
@@ -228,7 +260,11 @@ func (a *App) Quit() {
 	a.mu.Lock()
 	ctx := a.ctx
 	a.mu.Unlock()
-	_ = a.disconnect()
+	// 释放失败不能拦住退出（用户点了退出就该退出），但必须留记录：
+	// 这种情况用户下次登录会撞上「已在其他设备运行」，日志是唯一线索。
+	if err := a.disconnect(); err != nil {
+		a.logf("退出时释放租约失败，服务端将在 90 秒后自动回收：%v", err)
+	}
 	if ctx != nil {
 		runtime.Quit(ctx)
 	}
