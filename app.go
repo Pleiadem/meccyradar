@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	managementURL        = "MECCYRADAR_MANAGEMENT_URL"
+	managementURL = "MECCYRADAR_MANAGEMENT_URL"
 	// 指向真实 RentForge。mock 服务器（cmd/mockserver）只用于自测，
 	// 需要时用 MECCYRADAR_MANAGEMENT_URL 显式覆盖，绝不能做默认值：
 	// 连到 mock 会把所有真实卡密都判成无效，报错还长得像卡密本身有问题。
@@ -35,9 +35,9 @@ const (
 )
 
 var (
-	errNotAuthenticated  = errors.New("尚未登录")
-	errRadarProxyMissing      = errors.New("未配置 radar_tcp 代理")
-	errRadarPasswordRequired  = errors.New("请先填写雷达密码")
+	errNotAuthenticated      = errors.New("尚未登录")
+	errRadarProxyMissing     = errors.New("未配置 radar_tcp 代理")
+	errRadarPasswordRequired = errors.New("请先填写雷达密码")
 )
 
 type InitStateDTO struct {
@@ -61,6 +61,8 @@ type TunnelStatusDTO struct {
 	PingMS    int64  `json:"pingMs,omitempty"`
 	ExpiresIn int64  `json:"expiresIn,omitempty"`
 	Message   string `json:"message,omitempty"`
+	// Done 表示这一轮测速已结束，前端据此解除"测速中"。
+	Done bool `json:"done,omitempty"`
 }
 
 type PortStatusDTO struct {
@@ -81,16 +83,16 @@ type appDependencies struct {
 type App struct {
 	ctx context.Context
 
-	mu         sync.Mutex
-	deps       appDependencies
-	authData   *auth.AuthData
-	cardKey    string
+	mu       sync.Mutex
+	deps     appDependencies
+	authData *auth.AuthData
+	cardKey  string
 	// 雷达密码：来自界面输入，随会话持久化，重启后自动带出。
 	radarPassword string
-	engine     *frpengine.Engine
-	monitor    *monitor.Monitor
-	lastStatus string
-	initErr    error
+	engine        *frpengine.Engine
+	monitor       *monitor.Monitor
+	lastStatus    string
+	initErr       error
 }
 
 // resolveManagementURL returns the management endpoint, defaulting to the real
@@ -234,7 +236,7 @@ func (a *App) restoreCachedSession() {
 	}
 	data, err := client.Login(context.Background(), session.CardKey)
 	if err != nil {
-		a.emitStatus("error", 0, err.Error())
+		a.emitStatus("error", 0, err.Error(), false)
 		return
 	}
 	a.mu.Lock()
@@ -276,7 +278,7 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	if err != nil {
 		var conflictErr *auth.ConflictError
 		if errors.As(err, &conflictErr) {
-			a.emitStatus("conflict", 0, err.Error())
+			a.emitStatus("conflict", 0, err.Error(), false)
 		}
 		return AuthResultDTO{}, err
 	}
@@ -307,14 +309,14 @@ func (a *App) startTunnel() error {
 	ctx := a.ctx
 	a.mu.Unlock()
 
-	a.emitStatus("connecting", 0, "")
+	a.emitStatus("connecting", 0, "", false)
 	engine, err := frpengine.NewWithExit(data.FRPConfig, func(line string) { a.emitLog(line) }, func(err error) { a.handleEngineExit(err) })
 	if err != nil {
-		a.emitStatus("error", 0, err.Error())
+		a.emitStatus("error", 0, err.Error(), false)
 		return err
 	}
 	if err := engine.Start(); err != nil {
-		a.emitStatus("error", 0, err.Error())
+		a.emitStatus("error", 0, err.Error(), false)
 		return err
 	}
 	client := a.deps.client
@@ -387,7 +389,7 @@ func (a *App) handleEngineExit(err error) {
 	if mon != nil && mon.Running() {
 		_ = mon.Stop()
 	}
-	a.emitStatus("error", 0, err.Error())
+	a.emitStatus("error", 0, err.Error(), false)
 	a.emitLog("FRP tunnel exited: " + err.Error())
 }
 
@@ -467,13 +469,13 @@ func (a *App) Logout() error {
 	return firstErr
 }
 
-func (a *App) emitStatus(status string, pingMS int64, message string) {
+func (a *App) emitStatus(status string, pingMS int64, message string, done bool) {
 	a.mu.Lock()
 	a.lastStatus = status
 	ctx := a.ctx
 	a.mu.Unlock()
 	if ctx != nil {
-		runtime.EventsEmit(ctx, "tunnel:status", TunnelStatusDTO{Status: status, PingMS: pingMS, Message: message})
+		runtime.EventsEmit(ctx, "tunnel:status", TunnelStatusDTO{Status: status, PingMS: pingMS, Message: message, Done: done})
 	}
 }
 
@@ -487,7 +489,7 @@ func (a *App) handleMonitorEvent(event monitor.Event) {
 		}
 		return
 	}
-	a.emitStatus(string(event.Status), event.PingMS, event.Message)
+	a.emitStatus(string(event.Status), event.PingMS, event.Message, event.Done)
 }
 
 func (a *App) emitLog(message string) {

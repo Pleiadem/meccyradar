@@ -35,7 +35,9 @@ func pingMonitor(t *testing.T, latencies []int64, dialErr func(i int) error) (*M
 		},
 		Hooks: Hooks{
 			Emit: func(event Event) {
-				if event.Kind == "tunnel:status" && event.PingMS > 0 {
+				// 排除终态 Done 事件：它带的是同一个平均值，
+				// 算进来会让"每个成功样本各上报一次"的计数多一。
+				if event.Kind == "tunnel:status" && event.PingMS > 0 && !event.Done {
 					*pings = append(*pings, event.PingMS)
 				}
 			},

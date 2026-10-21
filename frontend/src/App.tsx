@@ -19,7 +19,7 @@ type AuthResult = {
   tunnelStatus: string
 }
 
-type TunnelStatus = { status: string; pingMs?: number; expiresIn?: number; message?: string; timeout?: boolean }
+type TunnelStatus = { status: string; pingMs?: number; expiresIn?: number; message?: string; timeout?: boolean; done?: boolean }
 type PortStatus = { open: boolean }
 type LogEvent = { message: string; at: string }
 
@@ -74,13 +74,12 @@ export default function App() {
       setInit((current) => ({ ...current, tunnelStatus: event.status, expiresIn: event.expiresIn ?? current.expiresIn }))
       // 直接采用后端算好的平均值（去极值后的均值），不再自己取最小值：
       // 平均值可能比上一次高，那正是要如实反映的结果。
-      if (typeof event.pingMs === 'number') {
-        setPingMs(event.pingMs)
-        stopMeasuring()
-      } else if (event.status === 'error') {
-        // 失败/超时同样是终态，必须解除"测速中"，否则按钮永久禁用。
-        stopMeasuring()
-      }
+      if (typeof event.pingMs === 'number') setPingMs(event.pingMs)
+      // 只有整轮结束（done）或错误才算终态。
+      // 中间样本同样是成功事件：若拿它解除"测速中"，按钮会在测速还没跑完时
+      // 重新可点，用户第二次点击会被后端以"测速进行中"拒绝，
+      // 而那一轮又不会再发终态事件 —— 界面就卡在"测速中…"了。
+      if (event.done || event.status === 'error') stopMeasuring()
       if (event.message) setError(event.message)
     })
     const offPort = runtime?.EventsOn?.('port:status', (...data) => {
@@ -175,8 +174,12 @@ export default function App() {
       await backend?.RemeasurePing?.()
     } catch (cause) {
       const message = toMessage(cause)
-      // 已有测速在跑：保持禁用状态，等那一轮的结果回来，不算错误。
-      if (message.includes('测速进行中')) return
+      // 已有测速在跑：保持禁用，等那一轮的 done 事件解除；不算错误。
+      // 重新计时兜底定时器，确保即使那个事件丢了也不会永久卡住。
+      if (message.includes('测速进行中')) {
+        startMeasuring()
+        return
+      }
       stopMeasuring()
       setError(message)
     }

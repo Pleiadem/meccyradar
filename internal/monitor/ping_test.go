@@ -52,7 +52,9 @@ func TestPingDoesNotReportFailureWhenSamplesAreZeroMS(t *testing.T) {
 				if event.Status == StatusError && event.Message == "节点测速失败" {
 					failed = true
 				}
-				if event.Status == StatusConnected {
+				// 只统计中间样本：终态 Done 事件带的是同一个平均值，
+				// 算进去会让"每次成功更新一次"的断言多出一次。
+				if event.Status == StatusConnected && !event.Done {
 					pings = append(pings, event.PingMS)
 				}
 			},
@@ -106,7 +108,7 @@ func TestPingDisplaysAfterFirstFailureThenSuccess(t *testing.T) {
 		},
 		Hooks: Hooks{
 			Emit: func(event Event) {
-				if event.Kind == "tunnel:status" && event.Status == StatusConnected {
+				if event.Kind == "tunnel:status" && event.Status == StatusConnected && !event.Done {
 					pings = append(pings, event.PingMS)
 				}
 			},
@@ -160,7 +162,7 @@ func TestRemeasurePingAsyncTriggersMeasurement(t *testing.T) {
 		},
 		Hooks: Hooks{
 			Emit: func(event Event) {
-				if event.Kind == "tunnel:status" && event.Status == StatusConnected {
+				if event.Kind == "tunnel:status" && event.Status == StatusConnected && !event.Done {
 					mu.Lock()
 					pings = append(pings, event.PingMS)
 					mu.Unlock()

@@ -32,7 +32,11 @@ type Event struct {
 	// Timeout 标记这一轮测速是因为整轮超时被强制结束的，
 	// 前端据此提示"测速超时，点击重试"而不是普通的测速失败。
 	Timeout bool
-	At      time.Time
+	// Done 标记这一轮测速已结束（成功/失败/超时都算）。
+	// 前端只能凭它解除"测速中"：中间样本也是成功事件，
+	// 如果拿它当终态，界面上按钮会在测速还没结束时就重新可点。
+	Done bool
+	At   time.Time
 }
 
 type Heartbeater interface {
@@ -62,8 +66,8 @@ type Config struct {
 	PingDialContext func(context.Context, string, string) (net.Conn, error)
 	// PingTimeout 整轮测速超时，留空用 pingRoundTimeout。
 	PingTimeout time.Duration
-	Now             func() time.Time
-	Hooks           Hooks
+	Now         func() time.Time
+	Hooks       Hooks
 }
 
 const (
@@ -300,6 +304,9 @@ func (m *Monitor) measureRound(ctx context.Context) {
 		})
 	}
 
+	// 每轮测速必定以恰好一个 Done=true 事件收尾。
+	// 这是前端能够解除"测速中"的唯一保证：无论成功、失败还是超时，
+	// 都不能出现"这一轮没有任何终态事件"的情况。
 	if timedOut {
 		// 超时必须给出终态事件，否则界面会一直停在"测速中…"。
 		m.emit(Event{
@@ -308,15 +315,25 @@ func (m *Monitor) measureRound(ctx context.Context) {
 			Message:   "测速超时，点击重试",
 			PingMS:    trimmedAverageMillis(samples),
 			Timeout:   true,
+			Done:      true,
 			ExpiresIn: m.expiresIn(),
 		})
 		m.log("节点测速超时，已强制结束本轮")
 		return
 	}
 	if !succeeded {
-		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "节点测速失败"})
+		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "节点测速失败", Done: true})
 		m.log("节点 TCP 测速失败")
+		return
 	}
+	// 正常跑完 10 个样本，补一个终态事件。
+	m.emit(Event{
+		Kind:      "tunnel:status",
+		Status:    StatusConnected,
+		PingMS:    trimmedAverageMillis(samples),
+		Done:      true,
+		ExpiresIn: m.expiresIn(),
+	})
 }
 
 // durationMillis 把耗时换算为毫秒（四舍五入）。
