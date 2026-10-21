@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 var ErrCardAlreadyOnline = errors.New("该卡密已在线")
@@ -161,7 +162,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return &ConflictError{Message: "当前卡密已在其他设备运行，请先退出原设备"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("服务端请求失败（HTTP %s）", resp.Status)
+		return statusError(resp.StatusCode, payload)
 	}
 	var envelope envelope
 	if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -177,6 +178,65 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return ErrInvalidResponse
 	}
 	return nil
+}
+
+// clientFacingStatus 是客户端会遇到的业务状态码及其兜底文案。
+//
+// 这些文案与服务端 MSG_* 常量保持一致：服务端在这些状态码上返回的是
+// 受控业务消息，客户端优先展示它；拿不到（或拿到的是技术文本）时用这里的兜底。
+var clientFacingStatus = map[int]string{
+	http.StatusUnauthorized:       "卡密不存在或格式不正确",
+	http.StatusForbidden:          "卡密已被禁用",
+	http.StatusNotFound:           "卡密不存在",
+	http.StatusConflict:           "该卡密已在其他设备上运行，请先退出原设备",
+	http.StatusTooManyRequests:    "操作过于频繁，请稍后重试",
+	http.StatusBadGateway:         "服务资源分配失败，请稍后重试",
+	http.StatusServiceUnavailable: "暂无可用服务器，请稍后重试",
+}
+
+// statusError 把非 2xx 响应转成用户能看懂的中文提示。
+//
+// 不能直接抛 resp.Status：那是 "401 Unauthorized" 这种 HTTP 术语，
+// 用户看到「服务端请求失败（HTTP 401 Forbidden）」只会一头雾水，
+// 既不知道是卡密问题，也不知道该做什么。
+func statusError(status int, payload []byte) error {
+	if message, ok := businessMessage(payload); ok {
+		if _, known := clientFacingStatus[status]; known {
+			return errors.New(message)
+		}
+	}
+	if fallback, known := clientFacingStatus[status]; known {
+		return errors.New(fallback)
+	}
+	return errors.New("连接失败，请检查网络后重试")
+}
+
+// businessMessage 从 FastAPI 的 {"detail": "..."} 里取出可展示的业务文案。
+//
+// 只接受"像业务文案"的内容：业务文案是中文短句，而框架/异常文本
+// （"Internal Server Error"、"lease invalid"、带堆栈的字符串）是英文或
+// 含 URL，一律拒绝 —— 这类内容展示给用户既看不懂，还可能泄露内部细节。
+func businessMessage(payload []byte) (string, bool) {
+	var body struct {
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return "", false
+	}
+	message := strings.TrimSpace(body.Detail)
+	if message == "" || len([]rune(message)) > 60 {
+		return "", false
+	}
+	if strings.Contains(message, "://") || strings.Contains(message, "Traceback") || strings.Contains(message, "Exception") {
+		return "", false
+	}
+	for _, r := range message {
+		if r > unicode.MaxASCII {
+			return message, true
+		}
+	}
+	// 纯 ASCII：视为技术文本，交给兜底文案
+	return "", false
 }
 
 // redactTransportError 把底层网络错误转成用户可读的提示。
