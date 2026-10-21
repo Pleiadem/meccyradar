@@ -26,7 +26,7 @@ smoke:
 	printf '%s\n' '[smoke] checking required implementation markers'; \
 	grep -q 'export default function App' $(FRONTEND)/src/App.tsx; \
 	grep -q 'runtime?.WindowMinimise' $(FRONTEND)/src/App.tsx; \
-	grep -q 'runtime?.Quit' $(FRONTEND)/src/App.tsx; \
+	grep -q 'backend?.CloseWindow' $(FRONTEND)/src/App.tsx; \
 	grep -q '授权状态' $(FRONTEND)/src/App.tsx; \
 	grep -q '雷达密码' $(FRONTEND)/src/App.tsx; \
 	grep -q 'function ConsoleView' $(FRONTEND)/src/App.tsx; \

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -129,7 +131,25 @@ func (a *App) startup(ctx context.Context) {
 	// Windows 需要在启动时就挂上托盘：窗口关闭后是隐藏而非退出，
 	// 没有托盘就再也点不回来了。
 	a.startTray()
+	a.handleProcessSignals()
 	go a.restoreCachedSession()
+}
+
+// handleProcessSignals 兜住 SIGINT/SIGTERM 这类非界面退出路径。
+//
+// 正常退出（托盘/界面按钮）会走 Quit() 释放租约；但被 Ctrl+C 或
+// 服务管理器终止时不会。这里补上，避免租约白占 90 秒（服务端 TTL）。
+// 注意：任务管理器强杀进程无法被任何处理器捕获，那种情况只能等
+// 服务端回收过期租约（RentForge 的 _release_stale_leases）。
+func (a *App) handleProcessSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-signals; !ok {
+			return
+		}
+		a.Quit()
+	}()
 }
 
 // restoreWindow 把隐藏或最小化的窗口拉回前台。
@@ -168,6 +188,39 @@ func (a *App) disconnect() error {
 // 关闭窗口只是隐藏（HideWindowOnClose），不会走到这里，隧道保持在线。
 func (a *App) shutdown(_ context.Context) {
 	_ = a.disconnect()
+}
+
+// hideWindow 只隐藏窗口，进程与隧道都继续运行。
+func (a *App) hideWindow() {
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx != nil {
+		runtime.WindowHide(ctx)
+	}
+}
+
+// shouldQuitOnClose 决定点关闭按钮时是"隐藏"还是"真退出"。
+//
+// 登录后有连接要维持，关窗只隐藏；未登录时没有任何需要维持的东西，
+// 关窗就应该真的退出 —— 否则用户以为关掉了，进程却挂在托盘里，
+// 再次双击图标还会被单实例挡回去，看起来像"打不开"。
+func (a *App) shouldQuitOnClose() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.authData == nil
+}
+
+// CloseWindow 处理界面上的关闭按钮。
+//
+// 窗口是无边框的（Frameless），界面上那个 X 是唯一的关闭入口，
+// 所以行为必须由后端判断：登录后隐藏并保持连接，未登录则真正退出。
+func (a *App) CloseWindow() {
+	if a.shouldQuitOnClose() {
+		a.Quit()
+		return
+	}
+	a.hideWindow()
 }
 
 // Quit 供界面或托盘调用：先断开再退出，避免退出后卡密仍被占用。

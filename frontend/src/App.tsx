@@ -32,13 +32,13 @@ type Backend = {
   RadarPassword?: () => Promise<string>
   SaveRadarPassword?: (password: string) => Promise<void>
   RemeasurePing?: () => Promise<void>
+  CloseWindow?: () => void
   Logout?: () => Promise<void>
 }
 
 type Runtime = {
   EventsOn?: (eventName: string, callback: (...data: unknown[]) => void) => () => void
   WindowMinimise?: () => void
-  WindowHide?: () => void
   Quit?: () => void
 }
 
@@ -213,7 +213,7 @@ function WindowShell({ authenticated, onLogout, children }: { authenticated: boo
     <div className="absolute right-2 top-1.5 z-30 flex items-center gap-1" style={{ '--wails-draggable': 'no-drag' } as CSSProperties}>
       {authenticated && <button aria-label="退出登录" onClick={onLogout} className="mr-1 rounded-lg px-2.5 py-2 text-xs text-white/55 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40">退出登录</button>}
       <button aria-label="最小化" title="最小化" onClick={() => runtime?.WindowMinimise?.()} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"><Minus size={15} strokeWidth={1.8} /></button>
-      <button aria-label="关闭窗口（保持连接）" title="关闭窗口（保持连接）" onClick={() => runtime?.WindowHide?.()} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-rose-500/80 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/70"><X size={15} strokeWidth={1.8} /></button>
+      <button aria-label="关闭窗口" title="关闭窗口" onClick={() => backend?.CloseWindow?.()} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-rose-500/80 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/70"><X size={15} strokeWidth={1.8} /></button>
     </div>
     <div className="h-full w-full">{children}</div>
   </div>
