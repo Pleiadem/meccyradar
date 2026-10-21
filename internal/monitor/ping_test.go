@@ -3,6 +3,8 @@ package monitor
 import (
 	"context"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -131,14 +133,15 @@ func TestPingUsesSeparateLongerDialTimeout(t *testing.T) {
 	}
 }
 
-// MeasurePingNow 必须能独立触发一轮测速（供界面点击重测）。
-func TestMeasurePingNowTriggersMeasurement(t *testing.T) {
+// RemeasurePingAsync 必须能独立触发一轮测速（供界面点击重测）。
+func TestRemeasurePingAsyncTriggersMeasurement(t *testing.T) {
 	latencies := make([]int64, pingSamples)
 	for i := range latencies {
 		latencies[i] = 30
 	}
 	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
-	dialed := 0
+	var dialed atomic.Int32
+	var mu sync.Mutex
 	var pings []int64
 	mon, err := New(Config{
 		ServerAddr:        "node.example",
@@ -149,8 +152,8 @@ func TestMeasurePingNowTriggersMeasurement(t *testing.T) {
 		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
 		Now:               clock.Now,
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
-			clock.advance(time.Duration(latencies[dialed]) * time.Millisecond)
-			dialed++
+			index := int(dialed.Add(1)) - 1
+			clock.advance(time.Duration(latencies[index]) * time.Millisecond)
 			conn, peer := net.Pipe()
 			_ = peer.Close()
 			return conn, nil
@@ -158,7 +161,9 @@ func TestMeasurePingNowTriggersMeasurement(t *testing.T) {
 		Hooks: Hooks{
 			Emit: func(event Event) {
 				if event.Kind == "tunnel:status" && event.Status == StatusConnected {
+					mu.Lock()
 					pings = append(pings, event.PingMS)
+					mu.Unlock()
 				}
 			},
 		},
@@ -166,10 +171,19 @@ func TestMeasurePingNowTriggersMeasurement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mon.MeasurePingNow(context.Background())
+	if err := mon.RemeasurePingAsync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pings) == pingSamples
+	})
+	mu.Lock()
+	defer mu.Unlock()
 
-	if dialed != pingSamples {
-		t.Fatalf("重测应重新采样 %d 次，实际 %d", pingSamples, dialed)
+	if dialed.Load() != pingSamples {
+		t.Fatalf("重测应重新采样 %d 次，实际 %d", pingSamples, dialed.Load())
 	}
 	if len(pings) != pingSamples {
 		t.Fatalf("重测应产生 %d 次更新，实际 %v", pingSamples, pings)

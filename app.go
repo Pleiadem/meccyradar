@@ -442,9 +442,9 @@ func (a *App) RemeasurePing() error {
 		ctx = context.Background()
 	}
 	// 异步执行：测速要连 10 次，同步等待会卡住界面线程。
-	// 结果通过 tunnel:status 事件推给界面。
-	go mon.MeasurePingNow(ctx)
-	return nil
+	// 结果通过 tunnel:status 事件推给界面；已有测速在进行时这里会
+	// 同步返回 ErrPingInProgress（"测速进行中"），不会堆积协程。
+	return mon.RemeasurePingAsync(ctx)
 }
 
 func (a *App) Logout() error {

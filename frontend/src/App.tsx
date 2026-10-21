@@ -19,7 +19,7 @@ type AuthResult = {
   tunnelStatus: string
 }
 
-type TunnelStatus = { status: string; pingMs?: number; expiresIn?: number; message?: string }
+type TunnelStatus = { status: string; pingMs?: number; expiresIn?: number; message?: string; timeout?: boolean }
 type PortStatus = { open: boolean }
 type LogEvent = { message: string; at: string }
 
@@ -57,6 +57,7 @@ export default function App() {
   const [copied, setCopied] = useState(false)
   const [pingMs, setPingMs] = useState<number>()
   const [measuring, setMeasuring] = useState(false)
+  const measureTimer = useRef<number | undefined>(undefined)
   const [portOpen, setPortOpen] = useState(false)
   const [logs, setLogs] = useState<LogEvent[]>([])
   const logBox = useRef<HTMLDivElement>(null)
@@ -73,7 +74,13 @@ export default function App() {
       setInit((current) => ({ ...current, tunnelStatus: event.status, expiresIn: event.expiresIn ?? current.expiresIn }))
       // 直接采用后端算好的平均值（去极值后的均值），不再自己取最小值：
       // 平均值可能比上一次高，那正是要如实反映的结果。
-      if (typeof event.pingMs === 'number') { setPingMs(event.pingMs); setMeasuring(false) }
+      if (typeof event.pingMs === 'number') {
+        setPingMs(event.pingMs)
+        stopMeasuring()
+      } else if (event.status === 'error') {
+        // 失败/超时同样是终态，必须解除"测速中"，否则按钮永久禁用。
+        stopMeasuring()
+      }
       if (event.message) setError(event.message)
     })
     const offPort = runtime?.EventsOn?.('port:status', (...data) => {
@@ -84,7 +91,12 @@ export default function App() {
       const event = data[0] as LogEvent | undefined
       if (event) setLogs((current) => [...current.slice(-99), event])
     })
-    return () => { offStatus?.(); offPort?.(); offLog?.() }
+    return () => {
+      window.clearTimeout(measureTimer.current)
+      offStatus?.()
+      offPort?.()
+      offLog?.()
+    }
   }, [])
 
   useEffect(() => {
@@ -140,14 +152,33 @@ export default function App() {
     } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
   }
 
+  const stopMeasuring = () => {
+    window.clearTimeout(measureTimer.current)
+    setMeasuring(false)
+  }
+
+  const startMeasuring = () => {
+    setMeasuring(true)
+    window.clearTimeout(measureTimer.current)
+    // 兜底：即使后端一个事件都没回来（进程被杀、事件通道断开），
+    // 界面也不会永久停在"测速中…"。
+    measureTimer.current = window.setTimeout(() => {
+      setMeasuring(false)
+      setError('测速超时，点击重试')
+    }, 30000)
+  }
+
   const remeasure = async () => {
     if (measuring) return
-    setMeasuring(true)
+    startMeasuring()
     try {
       await backend?.RemeasurePing?.()
     } catch (cause) {
-      setMeasuring(false)
-      setError(toMessage(cause))
+      const message = toMessage(cause)
+      // 已有测速在跑：保持禁用状态，等那一轮的结果回来，不算错误。
+      if (message.includes('测速进行中')) return
+      stopMeasuring()
+      setError(message)
     }
   }
 

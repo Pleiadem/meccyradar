@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,7 +29,10 @@ type Event struct {
 	PortOpen  bool
 	ExpiresIn int64
 	Message   string
-	At        time.Time
+	// Timeout 标记这一轮测速是因为整轮超时被强制结束的，
+	// 前端据此提示"测速超时，点击重试"而不是普通的测速失败。
+	Timeout bool
+	At      time.Time
 }
 
 type Heartbeater interface {
@@ -56,6 +60,8 @@ type Config struct {
 	// 留空时：若 DialContext 是外部注入的（测试/自定义）则沿用它，
 	// 否则用 pingDialTimeout 的默认 dialer。
 	PingDialContext func(context.Context, string, string) (net.Conn, error)
+	// PingTimeout 整轮测速超时，留空用 pingRoundTimeout。
+	PingTimeout time.Duration
 	Now             func() time.Time
 	Hooks           Hooks
 }
@@ -66,10 +72,19 @@ const (
 	// probeDialTimeout 本地端口探测的超时：只判断本地端口是否可连，
 	// 保持短超时以免拖慢状态刷新。
 	probeDialTimeout = 500 * time.Millisecond
+	// pingRoundTimeout 整轮测速的硬超时（10 次 × 2s + 余量）。
+	// 这是"不卡死"的最后一道保险：即使某个 dial 不响应取消，
+	// 整轮也会在这里被切断并上报超时。
+	pingRoundTimeout = 25 * time.Second
 )
+
+// ErrPingInProgress 表示已有一轮测速在进行，用于拒绝并发重测。
+var ErrPingInProgress = errors.New("测速进行中")
 
 type Monitor struct {
 	cfg Config
+	// pinging 保证同一时刻只有一轮测速，避免连点重测造成协程堆积。
+	pinging atomic.Bool
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -158,7 +173,9 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 		m.expire(errors.New("授权已过期"))
 		return
 	}
-	m.measurePing(ctx)
+	// 连接时同步测速；出错（含"已有测速在进行"）都不影响隧道主循环。
+	// measurePing 自身有整轮超时，不会把心跳/端口探测拖住。
+	_ = m.measurePing(ctx)
 	if !m.heartbeat(ctx) {
 		return
 	}
@@ -203,18 +220,72 @@ const pingSamples = 10
 // 为什么每次都要上报而不是只报最终值：用户要的是"始终显示见过的最快延迟"，
 // 首次成功就要立刻有数字，之后只在更快时更新。若只发一次最终值，界面在
 // 整个测速期间都是空的，用户以为没在测。
-func (m *Monitor) measurePing(ctx context.Context) {
+// measurePing 同步跑一轮测速（连接时调用），带重入保护。
+func (m *Monitor) measurePing(ctx context.Context) error {
+	if err := m.acquirePing(); err != nil {
+		return err
+	}
+	defer m.pinging.Store(false)
+	m.measureRound(ctx)
+	return nil
+}
+
+// acquirePing 原子抢占测速权；已被占用返回 ErrPingInProgress。
+func (m *Monitor) acquirePing() error {
+	if !m.pinging.CompareAndSwap(false, true) {
+		return ErrPingInProgress
+	}
+	return nil
+}
+
+// RemeasurePingAsync 供界面"点击重测"使用。
+//
+// 同步抢占标志位再异步执行：这样连续点击的第二次会立刻被拒绝，
+// 而不是等协程起来才发现重复（那种竞态下两次都会跑完）。
+func (m *Monitor) RemeasurePingAsync(ctx context.Context) error {
+	if err := m.acquirePing(); err != nil {
+		return err
+	}
+	go func() {
+		defer m.pinging.Store(false)
+		m.measureRound(ctx)
+	}()
+	return nil
+}
+
+func (m *Monitor) measureRound(ctx context.Context) {
+	// 整轮硬超时：这是"绝不卡死"的兜底。
+	// 单个 dial 有 2s 超时，但 10 次串起来最坏 20s，
+	// 且无法排除某个 dial 不响应取消，所以整轮必须自己封顶。
+	round := m.cfg.PingTimeout
+	if round <= 0 {
+		round = pingRoundTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, round)
+	defer cancel()
+
 	address := net.JoinHostPort(m.cfg.ServerAddr, fmt.Sprint(m.cfg.ServerPort))
 	samples := make([]int64, 0, pingSamples)
 	// 用独立的标记判断"是否有过成功样本"。
 	// 不能用样本值 == 0 代替：本机开着 TUN/代理时握手可能本地完成，
 	// 取整后正好是 0ms，那样会把成功的测速误判成"节点测速失败"。
 	succeeded := false
+	timedOut := false
 	for i := 0; i < pingSamples; i++ {
+		// 每轮开始前检查：整轮已超时或隧道已停止时立刻退出，
+		// 不再发起新的 dial。
+		if ctx.Err() != nil {
+			timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+			break
+		}
 		started := m.cfg.Now()
 		conn, err := m.cfg.PingDialContext(ctx, "tcp", address)
 		if err != nil {
 			// 单次失败不影响其余样本，也不丢弃已采集的样本。
+			if ctx.Err() != nil {
+				timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+				break
+			}
 			continue
 		}
 		_ = conn.Close()
@@ -228,15 +299,24 @@ func (m *Monitor) measurePing(ctx context.Context) {
 			ExpiresIn: m.expiresIn(),
 		})
 	}
+
+	if timedOut {
+		// 超时必须给出终态事件，否则界面会一直停在"测速中…"。
+		m.emit(Event{
+			Kind:      "tunnel:status",
+			Status:    StatusError,
+			Message:   "测速超时，点击重试",
+			PingMS:    trimmedAverageMillis(samples),
+			Timeout:   true,
+			ExpiresIn: m.expiresIn(),
+		})
+		m.log("节点测速超时，已强制结束本轮")
+		return
+	}
 	if !succeeded {
 		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "节点测速失败"})
 		m.log("节点 TCP 测速失败")
 	}
-}
-
-// MeasurePingNow 供界面"点击重测"调用，立即跑一轮测速。
-func (m *Monitor) MeasurePingNow(ctx context.Context) {
-	m.measurePing(ctx)
 }
 
 // durationMillis 把耗时换算为毫秒（四舍五入）。
