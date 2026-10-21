@@ -79,7 +79,10 @@ func TestCopyShareLinkWithRentForgePayload(t *testing.T) {
 }
 
 // 密码为空时不得产出 `k=` 这种缺参数的链接，必须明确报错。
-func TestCopyShareLinkRejectsEmptyPassword(t *testing.T) {
+// 产品决策已反转：空密码不再拦截，照常生成 k= 留空的链接。
+// 原先这里断言"空密码必须报错"，理由是空 k= 的链接打不开；
+// 现在改由界面提示（不足 8 位时按钮置灰），后端不拦。
+func TestCopyShareLinkAllowsEmptyPassword(t *testing.T) {
 	var copied string
 	app := newApp(appDependencies{
 		store:     config.NewMemoryStore(),
@@ -92,15 +95,11 @@ func TestCopyShareLinkRejectsEmptyPassword(t *testing.T) {
 			Proxies:    []auth.Proxy{{Name: "card_abc_tcp", Type: "tcp", RemotePort: 8000}},
 		},
 	}
-	err := app.CopyShareLink("")
-	if err == nil {
-		t.Fatal("空密码必须报错，不能生成 k= 的空链接")
+	if err := app.CopyShareLink(""); err != nil {
+		t.Fatalf("空密码不应报错，实际 %v", err)
 	}
-	if !strings.Contains(err.Error(), "密码") {
-		t.Fatalf("错误信息应提示密码，实际 %q", err.Error())
-	}
-	if copied != "" {
-		t.Fatalf("失败时不应写入剪贴板，实际 %q", copied)
+	if !strings.HasSuffix(copied, "&k=") {
+		t.Fatalf("应生成 k= 留空的链接，实际 %q", copied)
 	}
 }
 
