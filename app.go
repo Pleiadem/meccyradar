@@ -17,6 +17,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"meccyradar/internal/auth"
 	"meccyradar/internal/config"
+	"meccyradar/internal/diagnosis"
 	"meccyradar/internal/frpengine"
 	"meccyradar/internal/monitor"
 )
@@ -78,6 +79,13 @@ type TunnelStatusDTO struct {
 
 type PortStatusDTO struct {
 	Open bool `json:"open"`
+}
+
+type DiagnosisDTO struct {
+	Level string `json:"level"`
+	Title string `json:"title"`
+	Hint  string `json:"hint,omitempty"`
+	Raw   string `json:"raw,omitempty"`
 }
 
 type LogEventDTO struct {
@@ -400,13 +408,15 @@ func (a *App) startTunnel() error {
 	a.mu.Unlock()
 
 	a.emitStatus("connecting", 0, "", false, false)
-	engine, err := frpengine.NewWithExit(data.FRPConfig, func(line string) { a.emitLog(line) }, func(err error) { a.handleEngineExit(err) })
+	engine, err := frpengine.NewWithExit(data.FRPConfig, a.handleEngineLog, func(err error) { a.handleEngineExit(err) })
 	if err != nil {
 		a.emitStatus("error", 0, err.Error(), false, false)
+		a.emitDiagnosis(err.Error())
 		return err
 	}
 	if err := engine.Start(); err != nil {
 		a.emitStatus("error", 0, err.Error(), false, false)
+		a.emitDiagnosis(err.Error())
 		return err
 	}
 	client := a.deps.client
@@ -481,6 +491,7 @@ func (a *App) handleEngineExit(err error) {
 	}
 	a.emitStatus("error", 0, err.Error(), false, false)
 	a.emitLog("FRP tunnel exited: " + err.Error())
+	a.emitDiagnosis(err.Error())
 }
 
 func (a *App) CopyShareLink(password string) error {
@@ -580,6 +591,39 @@ func (a *App) handleMonitorEvent(event monitor.Event) {
 		return
 	}
 	a.emitStatus(string(event.Status), event.PingMS, event.Message, event.Done, event.Timeout)
+}
+
+// emitDiagnosis 把原始错误翻译成结构化提示推给界面。
+//
+// 分类在 Go 侧做（有测试覆盖），前端只负责渲染：前端改文案不该影响判定。
+func (a *App) emitDiagnosis(message string) {
+	if strings.TrimSpace(message) == "" {
+		return
+	}
+	result := diagnosis.Diagnose(message)
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx == nil {
+		return
+	}
+	runtime.EventsEmit(ctx, "tunnel:diagnosis", DiagnosisDTO{
+		Level: result.Level,
+		Title: result.Title,
+		Hint:  result.Hint,
+		Raw:   result.Raw,
+	})
+}
+
+// handleEngineLog 转发 FRPC 日志；命中已知失败特征时额外给一条结构化提示。
+//
+// 端口占用这类问题 FRPC 只写日志、不退出，所以必须在日志流里识别，
+// 否则用户只能自己从英文日志里找原因。
+func (a *App) handleEngineLog(line string) {
+	a.emitLog(line)
+	if diagnosis.IsRecognized(line) {
+		a.emitDiagnosis(line)
+	}
 }
 
 func (a *App) emitLog(message string) {

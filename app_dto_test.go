@@ -52,3 +52,33 @@ func TestTunnelStatusDTOOmitsDoneForIntermediateSamples(t *testing.T) {
 		t.Fatalf("中间样本不应带 done/timeout 字段，实际 %s", string(raw))
 	}
 }
+
+// 前端靠 level 决定高亮颜色、靠 title/hint 渲染提示框，所以钉住线格式。
+func TestDiagnosisDTOWireFormat(t *testing.T) {
+	raw, err := json.Marshal(DiagnosisDTO{
+		Level: "warning",
+		Title: "该端口已被占用",
+		Hint:  "请退出其他设备上的连接后重试",
+		Raw:   "start proxy error: port already in use",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{`"level":"warning"`, `"title":"该端口已被占用"`, `"hint":`, `"raw":`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("序列化结果缺少 %s，实际 %s", want, text)
+		}
+	}
+}
+
+// 认不出来的错误只带标题与原始信息，不应凭空生成解决建议。
+func TestDiagnosisDTOOmitsEmptyHint(t *testing.T) {
+	raw, err := json.Marshal(DiagnosisDTO{Level: "error", Title: "连接失败", Raw: "some odd failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"hint"`) {
+		t.Fatalf("没有建议时不应带 hint 字段，实际 %s", string(raw))
+	}
+}
