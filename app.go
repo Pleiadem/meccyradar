@@ -63,6 +63,8 @@ type TunnelStatusDTO struct {
 	Message   string `json:"message,omitempty"`
 	// Done 表示这一轮测速已结束，前端据此解除"测速中"。
 	Done bool `json:"done,omitempty"`
+	// Timeout 表示这一轮是因为整轮超时被强制结束的。
+	Timeout bool `json:"timeout,omitempty"`
 }
 
 type PortStatusDTO struct {
@@ -236,7 +238,7 @@ func (a *App) restoreCachedSession() {
 	}
 	data, err := client.Login(context.Background(), session.CardKey)
 	if err != nil {
-		a.emitStatus("error", 0, err.Error(), false)
+		a.emitStatus("error", 0, err.Error(), false, false)
 		return
 	}
 	a.mu.Lock()
@@ -278,7 +280,7 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	if err != nil {
 		var conflictErr *auth.ConflictError
 		if errors.As(err, &conflictErr) {
-			a.emitStatus("conflict", 0, err.Error(), false)
+			a.emitStatus("conflict", 0, err.Error(), false, false)
 		}
 		return AuthResultDTO{}, err
 	}
@@ -309,14 +311,14 @@ func (a *App) startTunnel() error {
 	ctx := a.ctx
 	a.mu.Unlock()
 
-	a.emitStatus("connecting", 0, "", false)
+	a.emitStatus("connecting", 0, "", false, false)
 	engine, err := frpengine.NewWithExit(data.FRPConfig, func(line string) { a.emitLog(line) }, func(err error) { a.handleEngineExit(err) })
 	if err != nil {
-		a.emitStatus("error", 0, err.Error(), false)
+		a.emitStatus("error", 0, err.Error(), false, false)
 		return err
 	}
 	if err := engine.Start(); err != nil {
-		a.emitStatus("error", 0, err.Error(), false)
+		a.emitStatus("error", 0, err.Error(), false, false)
 		return err
 	}
 	client := a.deps.client
@@ -389,7 +391,7 @@ func (a *App) handleEngineExit(err error) {
 	if mon != nil && mon.Running() {
 		_ = mon.Stop()
 	}
-	a.emitStatus("error", 0, err.Error(), false)
+	a.emitStatus("error", 0, err.Error(), false, false)
 	a.emitLog("FRP tunnel exited: " + err.Error())
 }
 
@@ -469,13 +471,13 @@ func (a *App) Logout() error {
 	return firstErr
 }
 
-func (a *App) emitStatus(status string, pingMS int64, message string, done bool) {
+func (a *App) emitStatus(status string, pingMS int64, message string, done, timeout bool) {
 	a.mu.Lock()
 	a.lastStatus = status
 	ctx := a.ctx
 	a.mu.Unlock()
 	if ctx != nil {
-		runtime.EventsEmit(ctx, "tunnel:status", TunnelStatusDTO{Status: status, PingMS: pingMS, Message: message, Done: done})
+		runtime.EventsEmit(ctx, "tunnel:status", TunnelStatusDTO{Status: status, PingMS: pingMS, Message: message, Done: done, Timeout: timeout})
 	}
 }
 
@@ -489,7 +491,7 @@ func (a *App) handleMonitorEvent(event monitor.Event) {
 		}
 		return
 	}
-	a.emitStatus(string(event.Status), event.PingMS, event.Message, event.Done)
+	a.emitStatus(string(event.Status), event.PingMS, event.Message, event.Done, event.Timeout)
 }
 
 func (a *App) emitLog(message string) {
