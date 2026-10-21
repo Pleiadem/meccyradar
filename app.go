@@ -338,6 +338,9 @@ func (a *App) restoreCachedSession() {
 	}
 	a.mu.Lock()
 	a.cardKey = session.CardKey
+	// 雷达密码也要回填：否则自动登录后界面是空的，
+	// 复制出的链接会缺 k= 参数。
+	a.radarPassword = session.RadarPassword
 	a.authData = &data
 	a.mu.Unlock()
 	_ = a.startTunnel()
@@ -416,7 +419,16 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 		}
 		return AuthResultDTO{}, err
 	}
-	if err := store.Save(config.Session{CardKey: cardKey}); err != nil {
+	// 必须把内存里的雷达密码一起写盘：只写 CardKey 会把已保存的密码抹掉，
+	// 用户下次打开又得重新填。
+	a.mu.Lock()
+	radarPassword := a.radarPassword
+	a.mu.Unlock()
+	if err := store.Save(config.Session{
+		CardKey:       cardKey,
+		SavedAtUnix:   time.Now().Unix(),
+		RadarPassword: radarPassword,
+	}); err != nil {
 		return AuthResultDTO{}, err
 	}
 	a.mu.Lock()

@@ -105,6 +105,11 @@ export default function App() {
     const offRestored = runtime?.EventsOn?.('session:restored', (...data) => {
       const state = data[0] as InitState | undefined
       if (state) setInit(state)
+      // 自动登录成功后把记住的雷达密码也填回去，否则界面是空的、
+      // 复制出来的链接会缺 k=。
+      if (backend?.RadarPassword) {
+        void backend.RadarPassword().then((saved) => { if (saved) setRadarPassword(saved) }).catch(() => {})
+      }
     })
     const offDiagnosis = runtime?.EventsOn?.('tunnel:diagnosis', (...data) => {
       const event = data[0] as Diagnosis | undefined
