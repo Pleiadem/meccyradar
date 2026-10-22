@@ -162,7 +162,7 @@ func TestMonitorStopsWhenServerExpiryTurnsPast(t *testing.T) {
 // 并发安全：心跳在写 expireAtUnix，倒计时在按秒读，不能 panic 也不能被 -race 抓到。
 func TestExpiresInIsConcurrencySafe(t *testing.T) {
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-1", HeartbeatInterval: 10 * time.Millisecond,
 		ExpireAtUnix: time.Now().Add(time.Hour).Unix(),
 		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
@@ -274,7 +274,7 @@ func newExpiryMonitor(t *testing.T, cfg expiryConfig) *expiryHarness {
 	t.Helper()
 	h := &expiryHarness{}
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-1",
 		// 心跳调快，让用例几秒内能跑完；到期检查仍是真实的 1 秒 ticker
 		HeartbeatInterval: 20 * time.Millisecond,

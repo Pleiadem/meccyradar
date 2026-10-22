@@ -299,9 +299,26 @@ auth.Client.Heartbeat(leaseId) → POST /api/client/heartbeat
 
 ### 4.5 换服 / 配置变更
 
-服务端改了卡的服务器后，旧租约立刻作废（`release_reason=migrate`）。
-客户端下次心跳收到 401 + `reason=migrate` → 静默重登拿新配置 →
-`frpConfigEqual` 比对发现配置变了 → `RestartTunnel` 重建 FRPC。
+设置面板的「更换服务器」调用 `POST /api/client/change-server`，请求带 `cardKey + leaseId`。
+服务端复用登录的卡密校验，且要求 leaseId 是该卡未过期的 active 租约。每卡 60 秒冷却。
+
+成功语义是「新激活，但保留期限」：新选另一台可用服务器，生成新用户名、token、端口，
+`expires_at` 和备注沿用原卡；本地切到新资源并签新租约，然后将旧服务器用户 **disable**
+（PATCH `enable=false`，不 DELETE）。成功响应和 `/client/login` 使用相同 envelope，
+客户端复用 `AuthData` 解析，刷新 `leaseGuard` 后自动重连；雷达分享链接随新的 FRP 地址/端口更新。
+
+如果旧用户 disable 失败，换服仍成功，但 `frps_migration_cleanups.cleanup_action=disable`
+持久化待办，管理端 retry endpoint 会重试 **PATCH enable=false**，不会 DELETE。
+后台 `migrate_card` 遗留待办的 `cleanup_action=delete` 保持原有 DELETE 语义。
+
+后台管理端改服（`migrate_card`）则是管理员指定目标服务器，旧用户删除；两者语义不同。
+
+
+客户端设置：标题栏齿轮打开 Glass 模态框，包含开机自启、更换服务器和退出登录。
+开机自启偏好持久化在 `UserConfigDir()/meccyradar/settings.json`，与加密凭据分开；
+Windows 系统侧的快捷方式是 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\MeccyRadar.lnk`，
+指向当前 exe 并传 `--autostart`。启动时会核对设置与快捷方式是否一致并修复缺失/残留/旧路径。
+不开注册表、不安装 Windows 服务。非 Windows 平台显示不支持。
 
 ### 4.6 退出（三条路，行为不同）
 
@@ -507,42 +524,19 @@ meccyradar/
 
 ## 9. 实现与文档/截图不一致的地方（需确认）
 
-### 9.1 ⚠️ 本地端口探测忽略服务端下发的 `localPort`
+### 9.1 ✅ 本地端口探测已改为独立循环并跟随代理配置
 
-`monitor.Config.LocalAddr` **在整个仓库里只有 monitor 内部的默认值**：
+修复后，探测不再依赖 monitor/隧道是否运行，而是在**已登录时**单独启动，周期 2 秒；
+退出登录时停止并把 UI 状态复位为「未监听」。
 
-```go
-// internal/monitor/monitor.go:179
-if cfg.LocalAddr == "" {
-    cfg.LocalAddr = "127.0.0.1:13133"   // 硬编码兜底
-}
-```
+探测地址取雷达代理的 `localIP:localPort`；找不到代理或端口无效时回退到
+`127.0.0.1:13133`。对应实现：`app_port.go` 的 `radarLocalAddr` / `runPortProbe`；
+循环与 `App` 实例绑定，不使用会产生 race 的包级探测周期变量。
 
-而 `app.go` 的 `startTunnel` 构造 `monitor.Config` 时**没有设置 `LocalAddr`**，
-所以**永远探测 `127.0.0.1:13133`**，与 `frpConfig.proxies[].localPort` 无关。
+### 9.2 ✅ 停止隧道后端口状态继续刷新
 
-- 现状能work，因为 RentForge 目前下发的 localPort 就是 13133。
-- 风险：服务端一旦下发别的 localPort（例如一个卡密对应不同本地端口），
-  FRP 会正确代理新端口，但界面仍探 13133 → 显示"未监听"，
-  而实际隧道是通的。用户会以为坏了。
-- 建议：`monitorConfig.LocalAddr = net.JoinHostPort(radarProxy.LocalIP, strconv.Itoa(radarProxy.LocalPort))`，
-  取不到再退回默认值。
-
-**需确认**：13133 是否应该完全跟随服务端（推荐），还是固定为产品约定常量？
-
-### 9.2 ⚠️ 停止隧道后端口状态不会重置（陈旧值）
-
-`portOpen` 在前端**只由 `port:status` 事件更新**，而 `stopTunnel` / `handleEngineExit`
-都不发 `port:status`。monitor 停了也就没人再探测了。
-
-结果：隧道停止后，"本地端口"这一行**保留停止前的最后状态**。
-如果停止前是"已监听"，停完还是"已监听"——但这时隧道根本没跑。
-
-这正好解释了「监听状态好像只有启动和停止才会刷新」的观感：
-运行中其实每 3 秒刷一次（`portTicker = 3s`），但停止后永远停在旧值，
-而用户最常看的就是"刚点了停止之后"。
-
-**建议**：`stopTunnel` 里主动 `EventsEmit("port:status", PortStatusDTO{Open:false})`。
+独立探测循环在隧道停止时继续运行，Fast 雷达关闭/启动都能在最多 2 秒内反映到
+「本地端口」行。只有退出登录才停探测并发一次 `false` 复位事件。
 
 ### 9.3 ⚠️ 截图里的「本地端口：已断开」在本代码库中不存在
 
@@ -597,6 +591,8 @@ if cfg.LocalAddr == "" {
 
 3. **Windows 精简版可能缺 WebView2**。已在 `wails.Run` 前预检并给中文提示。
 
+4. **开机自启快捷方式尚未在 Windows 实机验证**：PowerShell/WScript.Shell 创建逻辑、`StartHidden` 参数已实现并做 Windows 交叉编译；当前开发环境没有 Windows 桌面，快捷方式是否在真实启动时按预期隐藏窗口需实机确认。
+
 4. **只支持 Windows 打包**（`wails build -platform windows/amd64`）。
    macOS 可用于开发（`tray_other.go` 提供空实现）。
 
@@ -649,9 +645,9 @@ zip -j /tmp/meccyradar-windows-amd64.zip build/bin/meccyradar.exe
 
 | # | 问题 | 影响 |
 |---|---|---|
-| 1 | 13133 应跟随服务端 `localPort`，还是固定常量？ | 9.1 的修法 |
+| 1 | 截图"本地端口：已断开"是哪个版本 / 哪一行？ | 9.3，决定是否要加新文案 |
 | 2 | 截图"本地端口：已断开"是哪个版本 / 哪一行？ | 9.3，决定是否要加新文案 |
-| 3 | 端口状态应在停止后立即变"未监听"吗？ | 9.2，是否要补事件 |
-| 4 | 端口探测周期 3 秒是否合适？（改 1 秒更跟手，但多耗一点 CPU） | 体验权衡 |
+| 3 | 端口状态应在退出登录后立即复位，还是等待下一轮探测？ | 目前会立即复位 |
+| 4 | 端口探测周期 2 秒是否合适？ | 体验权衡 |
 | 5 | `findRadarProxy` 的 `card_*_tcp` 兜底是否保留？ | 与 SPEC「禁止兜底」冲突 |
 | 6 | 到期后是否要自动显示"重新登录"按钮（而不只是置灰）？ | UI 增强 |

@@ -27,7 +27,7 @@ func flakyLeaseServer(t *testing.T, failLogouts int32) (*httptest.Server, *atomi
 				"data": map[string]any{
 					"appName": "MeccyRadar", "shareBaseUrl": "http://radar.example/",
 					"expireAtUnix": 1893456000, "expireAtStr": "2030-01-01 00:00",
-					"session":   map[string]any{"leaseId": "lease-1", "heartbeatInterval": 30, "leaseExpireAtUnix": 1893456000},
+					"session": map[string]any{"leaseId": "lease-1", "heartbeatInterval": 30, "leaseExpireAtUnix": 1893456000},
 					"frpConfig": map[string]any{
 						"serverAddr": "node.example", "serverPort": 7000,
 						"user": "user", "token": "secret-token",

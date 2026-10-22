@@ -46,7 +46,6 @@ func slowDialMonitor(t *testing.T, delay time.Duration, round time.Duration) (*M
 	mon, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		HeartbeatInterval: time.Hour,
 		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
 		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
@@ -99,7 +98,6 @@ func TestFailedRoundEmitsExactlyOneDoneEvent(t *testing.T) {
 	mon, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		HeartbeatInterval: time.Hour,
 		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
 		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
@@ -129,7 +127,6 @@ func TestTimedOutRoundEmitsExactlyOneDoneEvent(t *testing.T) {
 	mon, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		HeartbeatInterval: time.Hour,
 		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
 		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),

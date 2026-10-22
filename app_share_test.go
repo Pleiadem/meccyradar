@@ -178,7 +178,6 @@ func TestRemeasurePingTriggersMeasurement(t *testing.T) {
 	mon, err := monitor.New(monitor.Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		HeartbeatInterval: time.Hour,
 		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
 		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),

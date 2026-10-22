@@ -15,7 +15,6 @@ func pingMonitor(t *testing.T, latencies []int64, dialErr func(i int) error) (*M
 	mon, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		HeartbeatInterval: time.Hour,
 		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
 		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),
@@ -97,7 +96,6 @@ func TestPingAllFailuresStillReported(t *testing.T) {
 	mon, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		HeartbeatInterval: time.Hour,
 		LeaseExpireAtUnix: time.Now().Add(time.Hour).Unix(),
 		ExpireAtUnix:      time.Now().Add(24 * time.Hour).Unix(),

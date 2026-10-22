@@ -71,6 +71,11 @@ type leaseRequest struct {
 	LeaseID string `json:"leaseId"`
 }
 
+type changeServerRequest struct {
+	CardKey string `json:"cardKey"`
+	LeaseID string `json:"leaseId"`
+}
+
 type ConflictError struct{ Message string }
 
 func (e *ConflictError) Error() string { return e.Message }
@@ -80,11 +85,11 @@ func (e *ConflictError) Error() string { return e.Message }
 // 客户端要靠它决定"能不能自动重登"：只有被其他设备顶掉时绝对不能重登，
 // 否则两台机器会互相顶替，无限循环。
 const (
-	LeaseReasonTTL       = "ttl"      // 心跳超时（休眠/断网/强杀后租约过期）
-	LeaseReasonTakeover  = "takeover" // 被其他设备登录顶掉
-	LeaseReasonLogout    = "logout"   // 本机主动退出
-	LeaseReasonMigrate   = "migrate"  // 连接配置变更
-	LeaseReasonUnknown   = "unknown"  // 旧服务端没有 reason 字段
+	LeaseReasonTTL      = "ttl"      // 心跳超时（休眠/断网/强杀后租约过期）
+	LeaseReasonTakeover = "takeover" // 被其他设备登录顶掉
+	LeaseReasonLogout   = "logout"   // 本机主动退出
+	LeaseReasonMigrate  = "migrate"  // 连接配置变更
+	LeaseReasonUnknown  = "unknown"  // 旧服务端没有 reason 字段
 )
 
 // StatusError 是服务端非 2xx 响应。
@@ -205,6 +210,28 @@ func ParseExpiresAt(value string) int64 {
 		return 0
 	}
 	return parsed.Unix()
+}
+
+// ChangeServer 换到另一台服务器，保留原到期时间。
+//
+// 服务端返回的 envelope 与 /api/client/login 完全一致，所以这里直接复用
+// AuthData 解析，不需要第二套结构。换服会签发**新租约**，旧租约随即失效。
+func (c *Client) ChangeServer(ctx context.Context, cardKey, leaseID string) (AuthData, error) {
+	if strings.TrimSpace(cardKey) == "" {
+		return AuthData{}, errors.New("请输入卡密")
+	}
+	if strings.TrimSpace(leaseID) == "" {
+		return AuthData{}, errors.New("登录状态已失效，请重新登录")
+	}
+	var out AuthData
+	body := changeServerRequest{CardKey: cardKey, LeaseID: leaseID}
+	if err := c.doJSON(ctx, http.MethodPost, "/api/client/change-server", body, &out); err != nil {
+		return AuthData{}, err
+	}
+	if err := validateAuthData(out); err != nil {
+		return AuthData{}, err
+	}
+	return out, nil
 }
 
 func (c *Client) Logout(ctx context.Context, leaseID string) error {

@@ -73,6 +73,45 @@ var engineLogOverrides = []struct {
 	},
 }
 
+// engineLogTranslations 把常见的 FRPC 状态行翻成中文。
+//
+// 与 engineLogOverrides 的区别：这里**保留**原行的其他内容（代理名、错误
+// 细节），只把认出来的英文片段替换掉。用户仍能看到是哪个代理、什么原因。
+//
+// 顺序敏感：长句必须排在短句前面，否则 "try to reconnect to server" 会
+// 先被 "reconnect to server" 命中，留下一个孤零零的 "try to 正在重连服务器"。
+var engineLogTranslations = []struct {
+	needle      string
+	replacement string
+}{
+	{"try to reconnect to server", "正在重连服务器"},
+	{"reconnect to server", "重连服务器"},
+	{"server response timeout", "服务器响应超时"},
+	{"login to server success", "已连接服务器"},
+	{"start proxy success", "隧道已建立"},
+	{"proxy added", "代理已注册"},
+	{"proxy start error", "代理启动失败"},
+	{"heartbeat timeout", "心跳超时"},
+	{"client closed", "连接已关闭"},
+	{"connection closed", "连接已关闭"},
+	{"start error", "启动失败"},
+	{"connect to server error", "连接服务器出错"},
+}
+
+// translateEngineLog 替换认出来的英文片段，返回替换后的文本。
+func translateEngineLog(text string) (string, bool) {
+	lowered := strings.ToLower(text)
+	for _, rule := range engineLogTranslations {
+		index := strings.Index(lowered, rule.needle)
+		if index < 0 {
+			continue
+		}
+		translated := text[:index] + rule.replacement + text[index+len(rule.needle):]
+		return strings.TrimSpace(translated), true
+	}
+	return "", false
+}
+
 // sanitizeEngineLog 去掉 FRPC 行自带的日期时间与 run id，保留级别标记。
 //
 // 返回值是空字符串表示这一行不该显示给用户（纯技术噪音）。
@@ -92,6 +131,10 @@ func sanitizeEngineLog(line string) string {
 	// 直接匹配子串虽然也能命中，但用正文更不容易误伤。
 	if replaced, matched := engineLogReplacement(rest); matched {
 		return replaced
+	}
+	// 认出来的状态行翻成中文，其余内容保留。
+	if translated, ok := translateEngineLog(rest); ok {
+		rest = translated
 	}
 
 	if level == "" {

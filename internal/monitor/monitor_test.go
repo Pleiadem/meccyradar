@@ -22,7 +22,9 @@ func (f *fakeHeartbeat) Heartbeat(context.Context, string) (HeartbeatResult, err
 	return HeartbeatResult{}, f.err
 }
 
-func TestMonitorMeasuresPingsAndProbesPort(t *testing.T) {
+// 端口探测已经从 monitor 搬到 App 层（app_port.go）：
+// 它必须与隧道是否在跑解耦，所以这里只验测速与心跳。
+func TestMonitorMeasuresPingsAndHeartbeats(t *testing.T) {
 	base := time.Unix(1_000, 0)
 	var mu sync.Mutex
 	var events []Event
@@ -31,7 +33,6 @@ func TestMonitorMeasuresPingsAndProbesPort(t *testing.T) {
 	monitor, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		LeaseID:           "lease-1",
 		HeartbeatInterval: time.Hour,
 		LeaseExpireAtUnix: base.Add(time.Hour).Unix(),
@@ -60,20 +61,22 @@ func TestMonitorMeasuresPingsAndProbesPort(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	// pingSamples 次测速 + 1 次本地端口探测
-	if want := pingSamples + 1; len(dialCalls) != want {
-		t.Fatalf("expected %d dials (%d pings + 1 port probe), got %d (%v)", want, pingSamples, len(dialCalls), dialCalls)
+	// 只有 pingSamples 次测速，不再有端口探测
+	if want := pingSamples; len(dialCalls) != want {
+		t.Fatalf("expected %d ping dials, got %d (%v)", want, len(dialCalls), dialCalls)
 	}
 	if hb.calls != 1 {
 		t.Fatalf("expected one heartbeat, got %d", hb.calls)
 	}
-	var sawPing, sawPort bool
+	var sawPing bool
 	for _, event := range events {
+		if event.Kind == "port:status" {
+			t.Fatalf("monitor 不该再发端口事件（已搬到 App 层）：%+v", event)
+		}
 		sawPing = sawPing || (event.Kind == "tunnel:status" && event.PingMS >= 0)
-		sawPort = sawPort || event.Kind == "port:status"
 	}
-	if !sawPing || !sawPort {
-		t.Fatalf("missing expected events: %+v", events)
+	if !sawPing {
+		t.Fatalf("missing expected ping event: %+v", events)
 	}
 }
 
@@ -185,7 +188,6 @@ func TestHeartbeatKeepsAuthorizationAliveBeyondLeaseWindow(t *testing.T) {
 	monitor, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		LeaseID:           "lease-1",
 		HeartbeatInterval: 10 * time.Millisecond,
 		// 登录响应里的租约到期时间：只有 90 秒
@@ -235,7 +237,6 @@ func TestHeartbeatFailureStillStopsTunnel(t *testing.T) {
 	monitor, err := New(Config{
 		ServerAddr:        "node.example",
 		ServerPort:        7000,
-		LocalAddr:         "127.0.0.1:13133",
 		LeaseID:           "lease-1",
 		HeartbeatInterval: 10 * time.Millisecond,
 		// 租约时间给足一年，确保停止只可能来自心跳失败，而不是租约到期

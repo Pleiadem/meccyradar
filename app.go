@@ -96,6 +96,10 @@ type appDependencies struct {
 	store     config.CredentialStore
 	client    *auth.Client
 	clipboard func(context.Context, string) error
+	// settings 存用户偏好（开机自启等）。与凭据分开：退出登录不能把偏好清掉。
+	settings autostartStore
+	// autostart 是系统启动项操作；非 Windows 平台为 nil。
+	autostart autostartManager
 }
 
 type App struct {
@@ -117,6 +121,16 @@ type App struct {
 	logEmitter func(LogEventDTO)
 	// leaseRetryBackoff 是重登退避间隔；0 表示用默认值。测试里调小用。
 	leaseRetryBackoff time.Duration
+	// 本地端口探测循环（app_port.go）。与隧道无关，登录后一直跑。
+	portProbeCancel context.CancelFunc
+	portProbeDone   chan struct{}
+	portProbeKnown  bool
+	portProbeOpen   bool
+	// portProbeInterval 是该 App 的探测周期；零值使用默认 2 秒。实例字段避免
+	// 测试改包级 interval 时与另一个用例尚未退出的探测 goroutine 产生 race。
+	portProbeInterval time.Duration
+	// autostartMode 表示本次是开机自启拉起来的：窗口隐藏、自动登录并连隧道。
+	autostartMode bool
 }
 
 // resolveManagementURL returns the management endpoint, defaulting to the real
@@ -132,7 +146,15 @@ func NewApp() *App {
 	store, storeErr := config.NewDefaultStore()
 	baseURL := resolveManagementURL()
 	client, clientErr := auth.NewClient(baseURL, nil)
-	app := newApp(appDependencies{store: store, client: client, clipboard: runtime.ClipboardSetText})
+	settingsStore, _ := config.NewDefaultSettingsStore()
+	autostart, _ := newPlatformAutostart()
+	app := newApp(appDependencies{
+		store:     store,
+		client:    client,
+		clipboard: runtime.ClipboardSetText,
+		settings:  settingsStore,
+		autostart: autostart,
+	})
 	if storeErr != nil {
 		app.initErr = storeErr
 	} else if clientErr != nil {
@@ -153,6 +175,11 @@ func (a *App) startup(ctx context.Context) {
 	// 没有托盘就再也点不回来了。
 	a.startTray()
 	a.handleProcessSignals()
+	// 设置与系统启动项可能不一致（重装、手动删快捷方式、绿色版换目录），
+	// 启动时对齐一次。
+	a.syncAutostart()
+	// 开机自启拉起时自动恢复会话并连接；普通启动沿用同一恢复行为。
+	// StartHidden 由 main.go 控制，startup 时无需再显示/隐藏窗口。
 	go a.restoreCachedSession()
 }
 
@@ -349,6 +376,14 @@ func (a *App) restoreCachedSession() {
 	a.radarPassword = session.RadarPassword
 	a.authData = &data
 	a.mu.Unlock()
+	// 与手动登录相同：只有 Wails 运行时已启动才开探测循环。
+	// 测试直接调用 restoreCachedSession() 时没有 ctx，不应泄漏后台 goroutine。
+	a.mu.Lock()
+	hasRuntime := a.ctx != nil
+	a.mu.Unlock()
+	if hasRuntime {
+		a.startPortProbe()
+	}
 	_ = a.startTunnel()
 	a.emitSessionRestored()
 }
@@ -443,6 +478,14 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	a.lastStatus = "idle"
 	a.mu.Unlock()
 	a.lease.markHealthy(time.Now())
+	// Wails 的 startup 在生产中一定先设置 ctx；纯 Go 单测没有 UI 事件通道，
+	// 不应因为调用 LoginByCard 就泄漏一个永久后台探测 goroutine。
+	a.mu.Lock()
+	hasRuntime := a.ctx != nil
+	a.mu.Unlock()
+	if hasRuntime {
+		a.startPortProbe()
+	}
 	return AuthResultDTO{AppName: data.AppName, ExpireAtStr: data.ExpireAtStr, ExpireAtUnix: data.ExpireAtUnix, TunnelStatus: "idle"}, nil
 }
 
@@ -631,6 +674,7 @@ func (a *App) RemeasurePing() error {
 
 func (a *App) Logout() error {
 	_ = a.stopTunnel()
+	a.stopPortProbe()
 	a.mu.Lock()
 	client, store, data := a.deps.client, a.deps.store, a.authData
 	a.authData, a.cardKey, a.lastStatus = nil, "", "idle"
@@ -660,15 +704,8 @@ func (a *App) emitStatus(status string, pingMS int64, message string, done, time
 }
 
 func (a *App) handleMonitorEvent(event monitor.Event) {
-	if event.Kind == "port:status" {
-		a.mu.Lock()
-		ctx := a.ctx
-		a.mu.Unlock()
-		if ctx != nil {
-			runtime.EventsEmit(ctx, "port:status", PortStatusDTO{Open: event.PortOpen})
-		}
-		return
-	}
+	// 端口状态不再由 monitor 上报：它有自己的独立探测循环（app_port.go），
+	// 隧道停着的时候也要继续刷新。
 	a.emitStatus(string(event.Status), event.PingMS, event.Message, event.Done, event.Timeout)
 }
 

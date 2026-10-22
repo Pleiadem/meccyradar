@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type ReactNode, type RefObject } from 'react'
 import { motion } from 'motion/react'
 import { canToggleTunnel, tunnelButtonHint, tunnelButtonLabel } from './tunnel_button'
-import { AlertTriangle, Copy, Eye, EyeOff, Minus, Power, Radar, RefreshCw, X, XCircle } from 'lucide-react'
+import { AlertTriangle, Copy, Eye, EyeOff, Loader2, Minus, Power, Radar, RefreshCw, ServerCog, Settings, X, XCircle } from 'lucide-react'
 import './index.css'
 
 type InitState = {
@@ -38,6 +38,10 @@ type Backend = {
   CloseWindow?: () => void
   SavedCardKey?: () => Promise<string>
   Logout?: () => Promise<void>
+  ChangeServer?: () => Promise<AuthResult>
+  AutostartEnabled?: () => Promise<boolean>
+  AutostartSupported?: () => Promise<boolean>
+  SetAutostart?: (enabled: boolean) => Promise<void>
 }
 
 type Runtime = {
@@ -65,6 +69,14 @@ export default function App() {
   const [portOpen, setPortOpen] = useState(false)
   const [logs, setLogs] = useState<LogEvent[]>([])
   const [diagnosis, setDiagnosis] = useState<Diagnosis>()
+  // 设置面板
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [autostart, setAutostart] = useState(false)
+  const [autostartSupported, setAutostartSupported] = useState(true)
+  const [changingServer, setChangingServer] = useState(false)
+  const [confirmingChange, setConfirmingChange] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
+  const [settingsNotice, setSettingsNotice] = useState('')
   const logBox = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -227,8 +239,75 @@ export default function App() {
     try { await backend?.Logout?.(); setInit({ authenticated: false, tunnelStatus: 'idle' }); setError('') } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
   }
 
+  const openSettings = async () => {
+    setSettingsOpen(true); setSettingsError(''); setSettingsNotice(''); setConfirmingChange(false)
+    try {
+      const supported = await backend?.AutostartSupported?.()
+      setAutostartSupported(supported ?? false)
+      const enabled = await backend?.AutostartEnabled?.()
+      setAutostart(Boolean(enabled))
+    } catch { /* 读不到就按默认（关、不支持）显示，不打断用户 */ }
+  }
+
+  const closeSettings = () => {
+    if (changingServer) return
+    setSettingsOpen(false); setConfirmingChange(false); setSettingsError(''); setSettingsNotice('')
+  }
+
+  const toggleAutostart = async () => {
+    const next = !autostart
+    setSettingsError(''); setSettingsNotice('')
+    try {
+      await backend?.SetAutostart?.(next)
+      setAutostart(next)
+      setSettingsNotice(next ? '已开启开机自动启动' : '已关闭开机自动启动')
+    } catch (cause) { setSettingsError(toMessage(cause)) }
+  }
+
+  // 换服用两步确认（先点一次变"确认更换"，再点才执行）：
+  // 无边框窗口里 window.confirm 的表现依赖 WebView2 配置，不如自己做稳。
+  const requestChangeServer = () => {
+    setSettingsError(''); setSettingsNotice('')
+    if (!confirmingChange) { setConfirmingChange(true); return }
+    void runChangeServer()
+  }
+
+  const runChangeServer = async () => {
+    setChangingServer(true); setConfirmingChange(false); setSettingsError(''); setSettingsNotice('')
+    try {
+      const result = await backend?.ChangeServer?.()
+      if (result) setInit((current) => ({ ...current, ...result, authenticated: true }))
+      setSettingsNotice('更换成功，已重新连接')
+    } catch (cause) {
+      setSettingsError(toMessage(cause))
+    } finally { setChangingServer(false) }
+  }
+
+  const logoutFromSettings = async () => {
+    setSettingsOpen(false)
+    await logout()
+  }
+
   if (!hydrated) return <div className="flex min-h-screen items-center justify-center bg-black text-sm text-white/50">正在加载…</div>
-  return <WindowShell authenticated={init.authenticated} onLogout={logout}>
+  return <WindowShell
+    authenticated={init.authenticated}
+    onOpenSettings={() => { void openSettings() }}
+    overlay={settingsOpen ? (
+      <SettingsModal
+        autostart={autostart}
+        autostartSupported={autostartSupported}
+        changingServer={changingServer}
+        confirmingChange={confirmingChange}
+        error={settingsError}
+        notice={settingsNotice}
+        onToggleAutostart={() => { void toggleAutostart() }}
+        onChangeServer={requestChangeServer}
+        onCancelChange={() => setConfirmingChange(false)}
+        onLogout={() => { void logoutFromSettings() }}
+        onClose={closeSettings}
+      />
+    ) : undefined}
+  >
     {init.authenticated ? (
       <ConsoleView init={init} pingMs={pingMs} measuring={measuring} onRemeasure={remeasure} diagnosis={diagnosis} portOpen={portOpen} logs={logs} logBox={logBox} radarPassword={radarPassword} showRadarPassword={showRadarPassword} busy={busy} copied={copied} error={error} onPasswordChange={(value) => { setRadarPassword(value); void backend?.SaveRadarPassword?.(value) }} onTogglePassword={() => setShowRadarPassword(!showRadarPassword)} onToggleTunnel={toggleTunnel} onCopy={copyLink} onLogout={logout} />
     ) : (
@@ -237,17 +316,18 @@ export default function App() {
   </WindowShell>
 }
 
-function WindowShell({ authenticated, onLogout, children }: { authenticated: boolean; onLogout: () => void; children: ReactNode }) {
+function WindowShell({ authenticated, onOpenSettings, overlay, children }: { authenticated: boolean; onOpenSettings: () => void; overlay?: ReactNode; children: ReactNode }) {
   return <div className="glass-bg relative h-[100dvh] w-full overflow-hidden text-white">
     <div className="absolute left-0 top-0 z-20 h-11 w-[calc(100%-112px)]" style={{ '--wails-draggable': 'drag' } as CSSProperties}>
       {authenticated && <span className="absolute left-4 top-1/2 flex -translate-y-1/2 items-center gap-2 text-xs font-semibold tracking-wide text-white/85"><Radar size={15} strokeWidth={1.8} />MeccyRadar</span>}
     </div>
     <div className="absolute right-2 top-1.5 z-30 flex items-center gap-1" style={{ '--wails-draggable': 'no-drag' } as CSSProperties}>
-      {authenticated && <button aria-label="退出登录" onClick={onLogout} className="mr-1 rounded-lg px-2.5 py-2 text-xs text-white/55 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40">退出登录</button>}
+      {authenticated && <button aria-label="设置" title="设置" onClick={onOpenSettings} className="mr-1 flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"><Settings size={15} strokeWidth={1.8} /></button>}
       <button aria-label="最小化" title="最小化" onClick={() => runtime?.WindowMinimise?.()} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"><Minus size={15} strokeWidth={1.8} /></button>
       <button aria-label="关闭窗口" title="关闭窗口" onClick={() => backend?.CloseWindow?.()} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/75 transition-colors hover:bg-rose-500/80 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/70"><X size={15} strokeWidth={1.8} /></button>
     </div>
     <div className="h-full w-full">{children}</div>
+    {overlay}
   </div>
 }
 
@@ -282,3 +362,126 @@ const reveal = { hidden: { opacity: 0, y: 10 }, visible: { opacity: 1, y: 0, tra
 function StepItem({ number, text, active = false }: StepItemProps) { return <motion.div variants={reveal} className={`flex items-center gap-3 rounded-xl px-3 py-2 text-sm ${active ? 'border border-white bg-white text-black' : 'border-none bg-brand-gray text-white'}`}><span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs ${active ? 'bg-black text-white' : 'bg-white/10 text-white/40'}`}>{number}</span><span>{text}</span></motion.div> }
 function SocialButton({ icon, label }: SocialButtonProps) { return <button type="button" className="flex h-12 items-center justify-center gap-3 rounded-xl border border-white/10 bg-black text-sm font-medium text-white transition hover:bg-white/5 active:scale-[0.98]">{icon}{label}</button> }
 function InputGroup({ label, placeholder, type = 'text' }: InputGroupProps) { return <label className="block text-sm font-medium text-white">{label}<input required type={type} className="mt-2 h-11 w-full rounded-xl border-none bg-brand-gray px-4 text-white outline-none placeholder:text-white/20 focus:ring-2 focus:ring-white/20" placeholder={placeholder} /></label> }
+
+// 设置面板。
+//
+// 沿用 Glass 风格：半透明面板 + 1px 半透明白边 + 12px 圆角。
+// 三项：开机自启、更换服务器、退出登录。
+function SettingsModal({
+  autostart,
+  autostartSupported,
+  changingServer,
+  confirmingChange,
+  error,
+  notice,
+  onToggleAutostart,
+  onChangeServer,
+  onCancelChange,
+  onLogout,
+  onClose,
+}: {
+  autostart: boolean
+  autostartSupported: boolean
+  changingServer: boolean
+  confirmingChange: boolean
+  error: string
+  notice: string
+  onToggleAutostart: () => void
+  onChangeServer: () => void
+  onCancelChange: () => void
+  onLogout: () => void
+  onClose: () => void
+}) {
+  return (
+    <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]" onClick={changingServer ? undefined : onClose}>
+      <motion.div
+        initial={{ opacity: 0, scale: 0.97, y: 6 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        transition={{ duration: 0.18 }}
+        role="dialog"
+        aria-modal="true"
+        aria-label="设置"
+        onClick={(event) => event.stopPropagation()}
+        className="glass-panel w-full max-w-sm space-y-4 p-5"
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-base font-semibold tracking-tight">设置</h2>
+          <button
+            type="button"
+            aria-label="关闭设置"
+            onClick={onClose}
+            disabled={changingServer}
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-white/60 transition-colors hover:bg-white/10 hover:text-white disabled:opacity-40"
+          >
+            <X size={15} strokeWidth={1.8} />
+          </button>
+        </div>
+
+        {/* 开机自动启动 */}
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5">
+          <div className="min-w-0">
+            <p className="text-sm text-white/90">开机自动启动</p>
+            <p className="mt-0.5 text-[11px] text-white/45">
+              {autostartSupported ? '启动后自动登录并连接隧道' : '当前系统不支持'}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={autostart}
+            aria-label="开机自动启动"
+            disabled={!autostartSupported || changingServer}
+            onClick={onToggleAutostart}
+            className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40 ${autostart ? 'bg-emerald-300/80' : 'bg-white/15'}`}
+          >
+            <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${autostart ? 'left-[22px]' : 'left-0.5'}`} />
+          </button>
+        </div>
+
+        {/* 更换服务器 */}
+        <div className="space-y-2 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-sm text-white/90">更换服务器</p>
+              <p className="mt-0.5 text-[11px] text-white/45">换到另一台可用节点，授权期限不变</p>
+            </div>
+            <button
+              type="button"
+              onClick={onChangeServer}
+              disabled={changingServer}
+              className="flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.06] px-3 text-xs font-medium text-white transition-colors hover:border-white/30 hover:bg-white/10 disabled:cursor-wait disabled:opacity-50"
+            >
+              {changingServer ? <Loader2 size={13} className="animate-spin" /> : <ServerCog size={13} strokeWidth={1.8} />}
+              {changingServer ? '更换中…' : confirmingChange ? '确认更换' : '更换'}
+            </button>
+          </div>
+          {confirmingChange && (
+            <div className="flex items-center justify-between gap-2 rounded-lg bg-amber-300/10 px-2.5 py-1.5">
+              <p className="text-[11px] text-amber-200">会断开当前隧道并重新连接</p>
+              <button type="button" onClick={onCancelChange} className="shrink-0 text-[11px] text-white/60 underline-offset-2 hover:text-white hover:underline">
+                取消
+              </button>
+            </div>
+          )}
+        </div>
+
+        {error && (
+          <p role="alert" className="rounded-lg bg-rose-400/10 px-3 py-2 text-xs text-rose-200">{error}</p>
+        )}
+        {notice && !error && (
+          <p role="status" className="rounded-lg bg-emerald-300/10 px-3 py-2 text-xs text-emerald-200">{notice}</p>
+        )}
+
+        {/* 退出登录 */}
+        <button
+          type="button"
+          onClick={onLogout}
+          disabled={changingServer}
+          className="flex h-10 w-full items-center justify-center rounded-xl border border-rose-400/25 bg-rose-400/10 text-sm font-medium text-rose-200 transition-colors hover:bg-rose-400/15 disabled:opacity-40"
+        >
+          退出登录
+        </button>
+      </motion.div>
+    </div>
+  )
+}

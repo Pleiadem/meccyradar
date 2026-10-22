@@ -56,7 +56,7 @@ func newRetryHarness(t *testing.T, beat func(call int32) error) *retryHarness {
 
 	h := &retryHarness{}
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
 		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			return monitor.HeartbeatResult{}, beat(h.calls.Add(1))
@@ -98,7 +98,9 @@ func (h *retryHarness) waitFor(t *testing.T, cond func() bool, what string) {
 	t.Fatalf("等待超时：%s（已调用心跳 %d 次，stopped=%v）", what, h.calls.Load(), h.stopped.Load())
 }
 
-func networkErr() error { return &auth.TransportError{Timeout: true, Message: "连接服务端超时，请检查网络后重试"} }
+func networkErr() error {
+	return &auth.TransportError{Timeout: true, Message: "连接服务端超时，请检查网络后重试"}
+}
 
 // 心跳超时 → 重试 3 次 → 全失败 → 停止隧道。
 func TestHeartbeatTimeoutRetriesThenStops(t *testing.T) {
@@ -149,7 +151,7 @@ func TestHeartbeatUnauthorizedSkipsRetry(t *testing.T) {
 
 	var calls atomic.Int32
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
 		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			calls.Add(1)
@@ -192,7 +194,7 @@ func TestHeartbeatTakeoverSkipsRetry(t *testing.T) {
 	var calls atomic.Int32
 	var stopped atomic.Bool
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
 		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			calls.Add(1)
@@ -233,7 +235,7 @@ func TestRetryAbortsWhenErrorBecomesBusiness(t *testing.T) {
 	t.Cleanup(func() { monitor.SetHeartbeatRetryBackoffForTest(previous) })
 
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
 		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			if calls.Add(1) == 1 {

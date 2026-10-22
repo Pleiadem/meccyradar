@@ -323,7 +323,9 @@ func TestStartTunnelDoesNotReloginWhenLeaseFresh(t *testing.T) {
 func TestHeartbeatTrackerForwardsResult(t *testing.T) {
 	var seen []error
 	tracker := &heartbeatTracker{
-		inner:    authHeartbeatFunc(func(context.Context, string) (auth.HeartbeatResponse, error) { return auth.HeartbeatResponse{}, errors.New("boom") }),
+		inner: authHeartbeatFunc(func(context.Context, string) (auth.HeartbeatResponse, error) {
+			return auth.HeartbeatResponse{}, errors.New("boom")
+		}),
 		onResult: func(err error) { seen = append(seen, err) },
 	}
 	_, _ = tracker.Heartbeat(context.Background(), "lease-x")
@@ -351,7 +353,7 @@ func TestMonitorUsesRecoveredLease(t *testing.T) {
 	var used []string
 	var stopped bool
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-old", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
 		Heartbeater: heartbeatFunc(func(_ context.Context, leaseID string) (monitor.HeartbeatResult, error) {
 			mu.Lock()
@@ -403,7 +405,7 @@ func TestMonitorStopsWhenRecoveryDeclined(t *testing.T) {
 	var stoppedWith error
 	var message string
 	mon, err := monitor.New(monitor.Config{
-		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
+		ServerAddr: "node.example", ServerPort: 7000,
 		LeaseID: "lease-old", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
 		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			return monitor.HeartbeatResult{}, &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTakeover, Message: "该卡密已在其他设备登录，本机已停止"}

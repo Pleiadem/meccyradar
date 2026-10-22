@@ -15,8 +15,9 @@ import (
 // run id 在进入界面前就剥掉，`[I]` 保留。
 
 func TestSanitizeEngineLogStripsTimestampAndRunID(t *testing.T) {
-	raw := "2026-10-22 10:55:55.822 [I] [3dd5d268e800b46d] [card_xxx_tcp] start proxy success"
-	want := "[I] [card_xxx_tcp] start proxy success"
+	// 用一行不会被中文翻译规则改写的日志，专门验"剥时间戳/run id"。
+	raw := "2026-10-22 10:55:55.822 [I] [3dd5d268e800b46d] [card_xxx_tcp] connection established"
+	want := "[I] [card_xxx_tcp] connection established"
 	if got := sanitizeEngineLog(raw); got != want {
 		t.Fatalf("期望 %q，实际 %q", want, got)
 	}
@@ -49,7 +50,7 @@ func TestSanitizeEngineLogKeepsProxyName(t *testing.T) {
 func TestSanitizeEngineLogLeavesPlainMessagesAlone(t *testing.T) {
 	for _, line := range []string{
 		"登录状态已超时，正在自动重新登录",
-		"[I] [card_xxx_tcp] start proxy success",
+		"[I] [card_xxx_tcp] connection established",
 		"隧道连接成功，等待客户端请求",
 	} {
 		if got := sanitizeEngineLog(line); got != line {
@@ -90,7 +91,7 @@ func TestHandleEngineLogEmitsSingleTimestamp(t *testing.T) {
 	var captured LogEventDTO
 	app.logEmitter = func(event LogEventDTO) { captured = event }
 
-	app.handleEngineLog("2026-10-22 10:55:55.822 [I] [3dd5d268e800b46d] [card_xxx_tcp] start proxy success")
+	app.handleEngineLog("2026-10-22 10:55:55.822 [I] [3dd5d268e800b46d] [card_xxx_tcp] connection established")
 
 	if len(captured.At) != 8 {
 		t.Fatalf("at 必须是 HH:MM:SS，实际 %q", captured.At)
@@ -98,7 +99,7 @@ func TestHandleEngineLogEmitsSingleTimestamp(t *testing.T) {
 	if strings.Contains(captured.Message, "2026-10-22") {
 		t.Fatalf("message 里不该再有日期，实际 %q", captured.Message)
 	}
-	if !strings.Contains(captured.Message, "start proxy success") {
+	if !strings.Contains(captured.Message, "connection established") {
 		t.Fatalf("正文不能丢，实际 %q", captured.Message)
 	}
 }

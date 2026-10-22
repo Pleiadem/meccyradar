@@ -29,7 +29,6 @@ type Event struct {
 	Kind      string
 	Status    Status
 	PingMS    int64
-	PortOpen  bool
 	ExpiresIn int64
 	Message   string
 	// Timeout 标记这一轮测速是因为整轮超时被强制结束的，
@@ -92,7 +91,6 @@ type LeaseRecovery struct {
 type Config struct {
 	ServerAddr        string
 	ServerPort        int
-	LocalAddr         string
 	LeaseID           string
 	HeartbeatInterval time.Duration
 	LeaseExpireAtUnix int64
@@ -175,9 +173,6 @@ type Monitor struct {
 func New(cfg Config) (*Monitor, error) {
 	if cfg.ServerAddr == "" || cfg.ServerPort < 1 || cfg.ServerPort > 65535 {
 		return nil, errors.New("缺少服务器地址或端口")
-	}
-	if cfg.LocalAddr == "" {
-		cfg.LocalAddr = "127.0.0.1:13133"
 	}
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 30 * time.Second
@@ -263,12 +258,9 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 	if !m.heartbeat(ctx) {
 		return
 	}
-	m.probePort(ctx)
 
 	heartbeatTicker := time.NewTicker(m.cfg.HeartbeatInterval)
 	defer heartbeatTicker.Stop()
-	portTicker := time.NewTicker(3 * time.Second)
-	defer portTicker.Stop()
 	expiryTicker := time.NewTicker(time.Second)
 	defer expiryTicker.Stop()
 
@@ -284,8 +276,6 @@ func (m *Monitor) run(ctx context.Context, done chan struct{}) {
 			if !m.heartbeat(ctx) {
 				return
 			}
-		case <-portTicker.C:
-			m.probePort(ctx)
 		case <-expiryTicker.C:
 			if m.expired() {
 				m.expire(errors.New("授权已过期"))
@@ -551,14 +541,6 @@ func (m *Monitor) recoverLease(ctx context.Context, err error) bool {
 		m.cfg.Hooks.RestartTunnel()
 	}
 	return true
-}
-
-func (m *Monitor) probePort(ctx context.Context) {
-	conn, err := m.cfg.DialContext(ctx, "tcp", m.cfg.LocalAddr)
-	if err == nil {
-		_ = conn.Close()
-	}
-	m.emit(Event{Kind: "port:status", PortOpen: err == nil})
 }
 
 func (m *Monitor) expire(err error) {
