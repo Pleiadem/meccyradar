@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,30 @@ type Hooks struct {
 	Emit       func(Event)
 	StopTunnel func(error)
 	Log        func(string)
+	// RecoverLease 在心跳失败时被调用，用于静默重登。
+	// 返回 false 表示放弃（不重登/重登失败），monitor 会照常停止隧道。
+	//
+	// 分类（该不该重登、被顶掉要不要提示）全部由实现方决定：
+	// monitor 只负责"心跳失败了，你要不要接"，不解析错误类型，
+	// 免得把 auth 的业务语义漏进监控层。
+	RecoverLease func(ctx context.Context, err error) (LeaseRecovery, bool)
+	// RetryableHeartbeat 判断这次心跳失败是否值得重试（网络类：超时/断网/DNS）。
+	//
+	// 只有网络类才重试。业务错误（401/403/409）重试没有任何意义：
+	// 租约失效了再发一百次也是 401，反而把重登时机拖后。
+	RetryableHeartbeat func(err error) bool
+	// RestartTunnel 在重登后 FRPC 配置发生变化时调用。
+	// 配置没变就不要调：停一次隧道会让用户看到界面闪断。
+	RestartTunnel func()
+}
+
+// LeaseRecovery 是一次静默重登的结果。
+type LeaseRecovery struct {
+	// LeaseID 是重登后拿到的租约。
+	LeaseID string
+	// ConfigChanged 表示服务端下发的 FRPC 配置（地址/端口/user/token）
+	// 与当前隧道用的不同，必须重启 FRPC 才能生效。
+	ConfigChanged bool
 }
 
 type Config struct {
@@ -85,6 +110,29 @@ const (
 // ErrPingInProgress 表示已有一轮测速在进行，用于拒绝并发重测。
 var ErrPingInProgress = errors.New("测速进行中")
 
+// 心跳网络类失败的重试策略。
+const (
+	// heartbeatRetryAttempts 是网络类心跳失败的重试次数。
+	// 3 次 × (2s+4s+8s) 约 14 秒，够覆盖 Wi-Fi 切换/唤醒后的短暂断网，
+	// 又不会让用户等太久才看到"真的连不上"。
+	heartbeatRetryAttempts = 3
+)
+
+// heartbeatRetryBackoff 是第一次重试前的等待，之后每次翻倍（2s/4s/8s）。
+// 用变量而不是常量，测试里调小才不用真的等 14 秒。
+var heartbeatRetryBackoff = 2 * time.Second
+
+// SetHeartbeatRetryBackoffForTest 让测试把退避间隔调小。
+// 返回原值，调用方负责在 Cleanup 里还原。
+func SetHeartbeatRetryBackoffForTest(value time.Duration) time.Duration {
+	previous := heartbeatRetryBackoff
+	heartbeatRetryBackoff = value
+	return previous
+}
+
+// HeartbeatRetryAttempts 暴露重试次数给测试断言用。
+func HeartbeatRetryAttempts() int { return heartbeatRetryAttempts }
+
 type Monitor struct {
 	cfg Config
 	// pinging 保证同一时刻只有一轮测速，避免连点重测造成协程堆积。
@@ -94,6 +142,9 @@ type Monitor struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	running bool
+	// leaseID 会随静默重登更新，所以不能只放在 cfg 里（cfg 是值拷贝）。
+	// 只在 monitor 自己的 goroutine 里读写。
+	leaseID string
 }
 
 func New(cfg Config) (*Monitor, error) {
@@ -127,7 +178,7 @@ func New(cfg Config) (*Monitor, error) {
 	if cfg.ExpireAtUnix <= 0 {
 		return nil, errors.New("缺少到期时间")
 	}
-	return &Monitor{cfg: cfg}, nil
+	return &Monitor{cfg: cfg, leaseID: cfg.LeaseID}, nil
 }
 
 func (m *Monitor) Start() error {
@@ -136,6 +187,9 @@ func (m *Monitor) Start() error {
 	if m.running {
 		return errors.New("监控已在运行")
 	}
+	// 每次启动都从 cfg 重新取一次租约：同一张 Monitor 不会被复用，
+	// 但如果调用方在 Start 之前改了 cfg.LeaseID，这里要跟上。
+	m.leaseID = m.cfg.LeaseID
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.done = make(chan struct{})
@@ -376,14 +430,92 @@ func meanMillis(values []int64) int64 {
 }
 
 func (m *Monitor) heartbeat(ctx context.Context) bool {
-	if m.cfg.Heartbeater == nil || m.cfg.LeaseID == "" {
+	if m.cfg.Heartbeater == nil || m.leaseID == "" {
 		return true
 	}
-	if err := m.cfg.Heartbeater.Heartbeat(ctx, m.cfg.LeaseID); err != nil {
-		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: "心跳失败"})
-		m.log("服务端心跳失败")
+	if err := m.cfg.Heartbeater.Heartbeat(ctx, m.leaseID); err != nil {
+		// 网络类失败先原地重试：笔记本合盖唤醒、Wi-Fi 切换、临时丢包
+		// 都会让一两次心跳超时，这时候把隧道停掉纯属误伤。
+		if m.shouldRetryHeartbeat(err) && m.retryHeartbeat(ctx, err) {
+			return true
+		}
+		// 租约类失败走静默重登（被顶掉/网络类由实现方自己拒绝）。
+		if m.recoverLease(ctx, err) {
+			return true
+		}
+		m.emit(Event{Kind: "tunnel:status", Status: StatusError, Message: heartbeatFailureMessage(err)})
+		m.log(heartbeatFailureMessage(err))
 		m.stopTunnel(err)
 		return false
+	}
+	return true
+}
+
+// shouldRetryHeartbeat 只有实现方明确认定为网络类时才重试。
+// 没有配置判定函数时一律不重试，保持"立即停止"的保守行为。
+func (m *Monitor) shouldRetryHeartbeat(err error) bool {
+	if m.cfg.Hooks.RetryableHeartbeat == nil {
+		return false
+	}
+	return m.cfg.Hooks.RetryableHeartbeat(err)
+}
+
+// retryHeartbeat 按指数退避重试心跳。返回 true 表示重试中恢复成功。
+//
+// 退避 2s / 4s / 8s，共 heartbeatRetryAttempts 次。重试期间**不动隧道状态**：
+// 隧道还在跑，只是心跳这一路暂时不通，界面保持"运行中"比闪成错误更准确。
+func (m *Monitor) retryHeartbeat(ctx context.Context, cause error) bool {
+	delay := heartbeatRetryBackoff
+	for attempt := 1; attempt <= heartbeatRetryAttempts; attempt++ {
+		m.log(fmt.Sprintf("心跳失败，%s 后重试（%d/%d）：%s",
+			delay.Round(time.Millisecond), attempt, heartbeatRetryAttempts, heartbeatFailureMessage(cause)))
+		select {
+		case <-ctx.Done():
+			// 隧道被用户停掉/监控退出：不用再重试，也不算失败。
+			return false
+		case <-time.After(delay):
+		}
+		if err := m.cfg.Heartbeater.Heartbeat(ctx, m.leaseID); err == nil {
+			m.log("心跳已恢复")
+			return true
+		} else {
+			cause = err
+			if !m.shouldRetryHeartbeat(err) {
+				// 重试途中变成了业务错误（例如租约刚好过期）：立刻交给
+				// 重登/停止逻辑，别把剩下的重试次数浪费掉。
+				return false
+			}
+		}
+		delay *= 2
+	}
+	m.log(fmt.Sprintf("心跳连续失败 %d 次，已停止隧道", heartbeatRetryAttempts))
+	return false
+}
+
+// heartbeatFailureMessage 优先用错误自带的业务文案。
+// 被顶掉时服务端会回"该卡密已在其他设备登录，本机已停止"，
+// 这比笼统的"心跳失败"有用得多。
+func heartbeatFailureMessage(err error) string {
+	if err != nil && strings.TrimSpace(err.Error()) != "" {
+		return err.Error()
+	}
+	return "心跳失败"
+}
+
+// recoverLease 尝试静默重登。返回 true 表示租约已换新，隧道可以继续跑。
+func (m *Monitor) recoverLease(ctx context.Context, err error) bool {
+	if m.cfg.Hooks.RecoverLease == nil {
+		return false
+	}
+	recovery, ok := m.cfg.Hooks.RecoverLease(ctx, err)
+	if !ok || recovery.LeaseID == "" {
+		return false
+	}
+	m.leaseID = recovery.LeaseID
+	m.log("登录状态已恢复，隧道继续运行")
+	if recovery.ConfigChanged && m.cfg.Hooks.RestartTunnel != nil {
+		// 配置变了（换服/换端口）必须重启 FRPC，否则连的还是旧资源。
+		m.cfg.Hooks.RestartTunnel()
 	}
 	return true
 }

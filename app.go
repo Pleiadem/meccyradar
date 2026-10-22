@@ -111,6 +111,8 @@ type App struct {
 	monitor       *monitor.Monitor
 	lastStatus    string
 	initErr       error
+	// lease 记录手上的租约还能不能用，供 StartTunnel 判断要不要先重登。
+	lease leaseGuard
 }
 
 // resolveManagementURL returns the management endpoint, defaulting to the real
@@ -436,6 +438,7 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	a.authData = &data
 	a.lastStatus = "idle"
 	a.mu.Unlock()
+	a.lease.markHealthy(time.Now())
 	return AuthResultDTO{AppName: data.AppName, ExpireAtStr: data.ExpireAtStr, ExpireAtUnix: data.ExpireAtUnix, TunnelStatus: "idle"}, nil
 }
 
@@ -453,6 +456,19 @@ func (a *App) startTunnel() error {
 	}
 	data := *a.authData
 	ctx := a.ctx
+	a.mu.Unlock()
+
+	// 休眠一夜/长时间断网后，内存里的租约可能早已过期。直接拿它启动 FRPC
+	// 会得到"start proxy success + 1 秒后心跳 401"的假成功，所以先换新租约。
+	if err := a.refreshStaleLeaseBeforeStart(context.Background()); err != nil {
+		a.emitStatus("error", 0, err.Error(), false, false)
+		a.emitDiagnosis(err.Error())
+		return err
+	}
+	a.mu.Lock()
+	if a.authData != nil {
+		data = *a.authData
+	}
 	a.mu.Unlock()
 
 	a.emitStatus("connecting", 0, "", false, false)
@@ -475,11 +491,20 @@ func (a *App) startTunnel() error {
 		HeartbeatInterval: time.Duration(data.Session.HeartbeatInterval) * time.Second,
 		LeaseExpireAtUnix: data.Session.LeaseExpireAtUnix,
 		ExpireAtUnix:      data.ExpireAtUnix,
-		Heartbeater:       client,
+		// 包一层：startTunnel 需要知道"租约还剩多久"，而 monitor 只上报成败。
+		Heartbeater: &heartbeatTracker{inner: client, onResult: a.handleHeartbeatResult},
 		Hooks: monitor.Hooks{
 			Emit:       func(event monitor.Event) { a.handleMonitorEvent(event) },
 			StopTunnel: func(error) { _ = a.stopEngineFromMonitor() },
 			Log:        func(message string) { a.emitLog(message) },
+			// 心跳租约失效时静默重登；被顶掉/网络失败由它自己拒绝。
+			RecoverLease: a.recoverLease,
+			// 网络类心跳失败先退避重试 3 次，别把 Wi-Fi 切换当成掉线。
+			RetryableHeartbeat: isRetryableHeartbeat,
+			RestartTunnel: func() {
+				// 重登后配置变了（换服/换端口），必须重建 FRPC。
+				go func() { _ = a.restartTunnelAfterRecovery() }()
+			},
 		},
 	}
 	mon, err := monitor.New(monitorConfig)

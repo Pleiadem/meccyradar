@@ -75,6 +75,53 @@ type ConflictError struct{ Message string }
 
 func (e *ConflictError) Error() string { return e.Message }
 
+// 租约失效原因（与服务端 frps_activation.py 的 RELEASE_* 常量对应）。
+//
+// 客户端要靠它决定"能不能自动重登"：只有被其他设备顶掉时绝对不能重登，
+// 否则两台机器会互相顶替，无限循环。
+const (
+	LeaseReasonTTL       = "ttl"      // 心跳超时（休眠/断网/强杀后租约过期）
+	LeaseReasonTakeover  = "takeover" // 被其他设备登录顶掉
+	LeaseReasonLogout    = "logout"   // 本机主动退出
+	LeaseReasonMigrate   = "migrate"  // 连接配置变更
+	LeaseReasonUnknown   = "unknown"  // 旧服务端没有 reason 字段
+)
+
+// StatusError 是服务端非 2xx 响应。
+//
+// 除了给用户看的 Message，还带 Status 和 Reason：上层据此判断
+// "静默重登"还是"停止并提示"，不必去解析中文文案。
+type StatusError struct {
+	Status  int
+	Reason  string
+	Message string
+}
+
+func (e *StatusError) Error() string { return e.Message }
+
+// TransportError 表示请求根本没到服务端（超时 / 断网 / DNS 失败 / 连接被拒）。
+//
+// 与 StatusError 相对：那个是服务端明确回了错误码，重试没有意义；
+// 这个多半是链路抖动，值得退避重试。
+type TransportError struct {
+	Timeout bool
+	Message string
+}
+
+func (e *TransportError) Error() string { return e.Message }
+
+// IsLeaseExpired 表示租约类失效（可以尝试静默重登）。
+//
+// 被顶掉不算：那需要用户介入，自动重登只会让两台设备互踢。
+// 主动退出也不算：那是用户自己的决定，重登等于把刚退出的会话又拉起来。
+func (e *StatusError) IsLeaseExpired() bool {
+	switch e.Reason {
+	case LeaseReasonTTL, LeaseReasonMigrate, LeaseReasonUnknown:
+		return true
+	}
+	return false
+}
+
 // plainHTTPAllowedHosts 是允许明文 HTTP 的主机白名单。
 //
 // 默认规则是"非本机必须 HTTPS"：登录请求会带卡密，心跳会带租约 ID，
@@ -199,16 +246,33 @@ var clientFacingStatus = map[int]string{
 // 不能直接抛 resp.Status：那是 "401 Unauthorized" 这种 HTTP 术语，
 // 用户看到「服务端请求失败（HTTP 401 Forbidden）」只会一头雾水，
 // 既不知道是卡密问题，也不知道该做什么。
+//
+// 同时保留 Status 与服务端的机器可读 reason：上层靠它判断
+// "静默重登"还是"停止并提示"，不要去解析中文文案。
 func statusError(status int, payload []byte) error {
+	reason := businessReason(payload)
 	if message, ok := businessMessage(payload); ok {
 		if _, known := clientFacingStatus[status]; known {
-			return errors.New(message)
+			return &StatusError{Status: status, Reason: reason, Message: message}
 		}
 	}
 	if fallback, known := clientFacingStatus[status]; known {
-		return errors.New(fallback)
+		return &StatusError{Status: status, Reason: reason, Message: fallback}
 	}
-	return errors.New("连接失败，请检查网络后重试")
+	return &StatusError{Status: status, Reason: reason, Message: "连接失败，请检查网络后重试"}
+}
+
+// businessReason 取出服务端附带的机器可读失效原因。
+//
+// 老服务端没有这个字段，返回空串由调用方按"原因未知"处理。
+func businessReason(payload []byte) string {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(body.Reason)
 }
 
 // businessMessage 从 FastAPI 的 {"detail": "..."} 里取出可展示的业务文案。
@@ -247,11 +311,12 @@ func (c *Client) redactTransportError(err error) error {
 	log.Printf("management request to %s failed: %v", c.baseURL, err)
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		return errors.New("连接服务端超时，请检查网络后重试")
+		return &TransportError{Timeout: true, Message: "连接服务端超时，请检查网络后重试"}
 	case errors.Is(err, context.Canceled):
+		// 主动取消（用户停隧道）不该被当成网络故障重试。
 		return errors.New("请求已取消")
 	default:
-		return errors.New("无法连接服务端，请检查网络或服务端地址")
+		return &TransportError{Message: "无法连接服务端，请检查网络或服务端地址"}
 	}
 }
 
