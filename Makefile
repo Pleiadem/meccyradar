@@ -31,4 +31,6 @@ smoke:
 	grep -q '雷达密码' $(FRONTEND)/src/App.tsx; \
 	grep -q 'function ConsoleView' $(FRONTEND)/src/App.tsx; \
 	grep -q 'overflow-y-auto' $(FRONTEND)/src/App.tsx; \
+	printf '%s\n' '[smoke] running frontend unit tests'; \
+	cd $(FRONTEND) && node --test tests/*.test.mjs >/dev/null; \
 	printf '%s\n' '[smoke] passed'

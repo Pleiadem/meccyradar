@@ -23,7 +23,9 @@ func TestSanitizeEngineLogStripsTimestampAndRunID(t *testing.T) {
 }
 
 func TestSanitizeEngineLogKeepsLevelMarker(t *testing.T) {
-	got := sanitizeEngineLog("2026-10-22 10:55:56.001 [E] [3dd5d268e800b46d] login to server failed")
+	// 用不会被业务文案覆盖的行来验：登录失败那类现在会被翻成中文，
+	// 它的"级别保留"已不适用（见 TestSanitizeEngineLogRewritesLoginFailure）。
+	got := sanitizeEngineLog("2026-10-22 10:55:56.001 [E] [3dd5d268e800b46d] start error: connect timeout")
 	if !strings.HasPrefix(got, "[E]") {
 		t.Fatalf("级别标记要保留，实际 %q", got)
 	}
@@ -98,5 +100,85 @@ func TestHandleEngineLogEmitsSingleTimestamp(t *testing.T) {
 	}
 	if !strings.Contains(captured.Message, "start proxy success") {
 		t.Fatalf("正文不能丢，实际 %q", captured.Message)
+	}
+}
+
+// 到期后点连接，FRPC 只吐英文，用户完全看不懂。
+//
+// 原始行（真实格式，带级别与 run id）：
+//
+//	[E] [3dd5d268e800b46d] login to the server failed: <nil>. With
+//	    loginFailExit enabled, no additional retries will be attempted
+//
+// 这里统一换成一句能行动的提示。
+
+func TestSanitizeEngineLogRewritesLoginFailure(t *testing.T) {
+	inputs := []string{
+		// 规格里给的格式：方括号包住时间戳
+		"[2026-10-22 10:55:55] login to the server failed: <nil>. With loginFailExit enabled, no additional retries will be attempted",
+		// FRPC 真实格式：时间戳 + 级别 + run id
+		"2026-10-22 10:55:55.822 [E] [3dd5d268e800b46d] login to the server failed: <nil>. With loginFailExit enabled, no additional retries will be attempted",
+		// 没有 loginFailExit 尾句的变体
+		"2026-10-22 10:55:55.822 [E] [3dd5d268e800b46d] login to the server failed: connection refused",
+		// FRPC 另一个措辞：login to server failed
+		"[E] login to server failed: dial tcp: i/o timeout",
+	}
+	for _, input := range inputs {
+		if got := sanitizeEngineLog(input); got != msgEngineLoginFailed {
+			t.Fatalf("应替换成中文业务文案\n输入: %s\n实际: %q", input, got)
+		}
+	}
+}
+
+// loginFailExit 那行是纯技术细节，不显示给用户。
+func TestSanitizeEngineLogDropsLoginFailExitNoise(t *testing.T) {
+	inputs := []string{
+		"With loginFailExit enabled, no additional retries will be attempted",
+		"2026-10-22 10:55:55.822 [I] [3dd5d268e800b46d] With loginFailExit enabled, no additional retries will be attempted",
+		"[I] loginFailExit enabled",
+	}
+	for _, input := range inputs {
+		if got := sanitizeEngineLog(input); got != "" {
+			t.Fatalf("纯技术信息应被丢弃\n输入: %s\n实际: %q", input, got)
+		}
+	}
+}
+
+// 登录失败那行同时包含 loginFailExit，必须先命中"登录失败"规则，
+// 否则用户只会看到一片空白，反而更困惑。
+func TestLoginFailureWinsOverLoginFailExitNoise(t *testing.T) {
+	line := "login to the server failed: <nil>. With loginFailExit enabled, no additional retries will be attempted"
+	if got := sanitizeEngineLog(line); got != msgEngineLoginFailed {
+		t.Fatalf("登录失败必须优先于噪音丢弃，实际 %q", got)
+	}
+}
+
+// 中文业务文案里不该残留英文技术词，也不该带 [E] 前缀。
+func TestRewrittenLoginFailureHasNoTechnicalNoise(t *testing.T) {
+	got := sanitizeEngineLog("2026-10-22 10:55:55.822 [E] [3dd5d268e800b46d] login to the server failed: <nil>")
+	for _, forbidden := range []string{"[E]", "login", "FailExit", "<nil>", "retries", "3dd5d268"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("中文文案里不该出现 %q，实际 %q", forbidden, got)
+		}
+	}
+}
+
+// handleEngineLog 对空结果必须直接丢弃，不能推一条空日志给界面。
+func TestHandleEngineLogDropsNoiseLines(t *testing.T) {
+	app := newApp(appDependencies{})
+	var captured []LogEventDTO
+	app.logEmitter = func(event LogEventDTO) { captured = append(captured, event) }
+
+	app.handleEngineLog("With loginFailExit enabled, no additional retries will be attempted")
+	if len(captured) != 0 {
+		t.Fatalf("技术噪音不该推给界面，实际推了 %d 条：%#v", len(captured), captured)
+	}
+
+	app.handleEngineLog("2026-10-22 10:55:55.822 [E] [3dd5d268e800b46d] login to the server failed: <nil>")
+	if len(captured) != 1 {
+		t.Fatalf("登录失败应推一条，实际 %d 条", len(captured))
+	}
+	if captured[0].Message != msgEngineLoginFailed {
+		t.Fatalf("推给界面的应是中文文案，实际 %q", captured[0].Message)
 	}
 }

@@ -699,8 +699,13 @@ func (a *App) emitDiagnosis(message string) {
 // 端口占用这类问题 FRPC 只写日志、不退出，所以必须在日志流里识别，
 // 否则用户只能自己从英文日志里找原因。
 func (a *App) handleEngineLog(line string) {
-	// 先剥掉 FRPC 自带的日期时间与 run id，界面只保留自己的 HH:MM:SS。
+	// 先剥掉 FRPC 自带的日期时间与 run id，界面只保留自己的 HH:MM:SS；
+	// 命中已知的英文技术错误时换成中文业务文案。
 	clean := sanitizeEngineLog(line)
+	if clean == "" {
+		// 纯技术噪音（loginFailExit 之类），不显示给用户。
+		return
+	}
 	a.emitLog(clean)
 	// 诊断仍用原始行：分类规则是照着 FRPC 原文写的，剥过的行可能匹配不上。
 	if diagnosis.IsRecognized(line) {
