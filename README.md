@@ -1,5 +1,8 @@
 # MeccyRadar
 
+> 架构、业务流程、模块职责与已知问题见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+
 ## 本地登录测试
 
 启动独立 Mock 服务端：
