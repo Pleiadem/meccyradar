@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,10 +39,6 @@ type leaseServer struct {
 
 func newLeaseServer(t *testing.T) *leaseServer {
 	t.Helper()
-	// 退避调小：这些用例要跑好几轮重试，真等 2 秒会让整个包慢半分钟。
-	previous := leaseRecoverBackoff
-	leaseRecoverBackoff = time.Millisecond
-	t.Cleanup(func() { leaseRecoverBackoff = previous })
 	ls := &leaseServer{}
 	ls.heartbeatReason.Store("")
 	ls.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +124,9 @@ func newRecoveryApp(t *testing.T, ls *leaseServer) *App {
 		t.Fatal(err)
 	}
 	app := newApp(appDependencies{client: client, store: config.NewMemoryStore()})
+	// 退避调小：这些用例要跑好几轮重试，真等 2 秒会让整个包慢半分钟。
+	// 放在 App 字段上而不是包级变量，避免和其他用例残留的 goroutine 竞争。
+	app.leaseRetryBackoff = time.Millisecond
 	if _, err := app.LoginByCard("CARD-RECOVER"); err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +288,10 @@ func TestStartTunnelRefreshesStaleLeaseBeforeStarting(t *testing.T) {
 	app.lease.markHealthy(time.Now().Add(-8 * time.Hour))
 	app.lease.markFailed(auth.LeaseReasonTTL)
 
+	// 这个用例可能真的把隧道起起来（假服务端是可达的），必须收尾：
+	// 残留的 frp client 会和后续用例的 client 争 frp 内部状态（-race 会报）。
+	t.Cleanup(func() { _ = app.stopTunnel() })
+
 	before := ls.logins.Load()
 	err := app.StartTunnel()
 	if err != nil {
@@ -306,6 +310,8 @@ func TestStartTunnelDoesNotReloginWhenLeaseFresh(t *testing.T) {
 	app := newRecoveryApp(t, ls)
 
 	app.lease.markHealthy(time.Now())
+	t.Cleanup(func() { _ = app.stopTunnel() })
+
 	before := ls.logins.Load()
 	_ = app.StartTunnel()
 	if got := ls.logins.Load(); got != before {
@@ -317,34 +323,44 @@ func TestStartTunnelDoesNotReloginWhenLeaseFresh(t *testing.T) {
 func TestHeartbeatTrackerForwardsResult(t *testing.T) {
 	var seen []error
 	tracker := &heartbeatTracker{
-		inner:    heartbeatFunc(func(context.Context, string) error { return errors.New("boom") }),
+		inner:    authHeartbeatFunc(func(context.Context, string) (auth.HeartbeatResponse, error) { return auth.HeartbeatResponse{}, errors.New("boom") }),
 		onResult: func(err error) { seen = append(seen, err) },
 	}
-	_ = tracker.Heartbeat(context.Background(), "lease-x")
+	_, _ = tracker.Heartbeat(context.Background(), "lease-x")
 	if len(seen) != 1 || seen[0] == nil {
 		t.Fatalf("心跳失败必须回调一次且带错误，实际 %#v", seen)
 	}
 }
 
-type heartbeatFunc func(context.Context, string) error
+type heartbeatFunc func(context.Context, string) (monitor.HeartbeatResult, error)
 
-func (f heartbeatFunc) Heartbeat(ctx context.Context, leaseID string) error {
+func (f heartbeatFunc) Heartbeat(ctx context.Context, leaseID string) (monitor.HeartbeatResult, error) {
+	return f(ctx, leaseID)
+}
+
+// authHeartbeatFunc 是 auth 签名的心跳桩，用来测 heartbeatTracker 的适配。
+type authHeartbeatFunc func(context.Context, string) (auth.HeartbeatResponse, error)
+
+func (f authHeartbeatFunc) Heartbeat(ctx context.Context, leaseID string) (auth.HeartbeatResponse, error) {
 	return f(ctx, leaseID)
 }
 
 // monitor 层：RecoverLease 返回成功时不应停止隧道，并改用新租约。
 func TestMonitorUsesRecoveredLease(t *testing.T) {
+	var mu sync.Mutex
 	var used []string
 	var stopped bool
 	mon, err := monitor.New(monitor.Config{
 		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
 		LeaseID: "lease-old", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
-		Heartbeater: heartbeatFunc(func(_ context.Context, leaseID string) error {
+		Heartbeater: heartbeatFunc(func(_ context.Context, leaseID string) (monitor.HeartbeatResult, error) {
+			mu.Lock()
 			used = append(used, leaseID)
+			mu.Unlock()
 			if leaseID == "lease-old" {
-				return &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTTL, Message: "超时"}
+				return monitor.HeartbeatResult{}, &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTTL, Message: "超时"}
 			}
-			return nil
+			return monitor.HeartbeatResult{}, nil
 		}),
 		Hooks: monitor.Hooks{
 			StopTunnel: func(error) { stopped = true },
@@ -364,13 +380,18 @@ func TestMonitorUsesRecoveredLease(t *testing.T) {
 	// 等首轮心跳跑完
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(used) >= 1 {
+		mu.Lock()
+		got := len(used)
+		mu.Unlock()
+		if got >= 1 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(200 * time.Millisecond)
 
+	mu.Lock()
+	defer mu.Unlock()
 	if stopped {
 		t.Fatal("租约已成功恢复，不应停止隧道")
 	}
@@ -378,17 +399,26 @@ func TestMonitorUsesRecoveredLease(t *testing.T) {
 
 // monitor 层：RecoverLease 拒绝时照常停止隧道，并把服务端文案报上去。
 func TestMonitorStopsWhenRecoveryDeclined(t *testing.T) {
+	var mu sync.Mutex
 	var stoppedWith error
 	var message string
 	mon, err := monitor.New(monitor.Config{
 		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
 		LeaseID: "lease-old", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
-		Heartbeater: heartbeatFunc(func(context.Context, string) error {
-			return &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTakeover, Message: "该卡密已在其他设备登录，本机已停止"}
+		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
+			return monitor.HeartbeatResult{}, &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTakeover, Message: "该卡密已在其他设备登录，本机已停止"}
 		}),
 		Hooks: monitor.Hooks{
-			StopTunnel:   func(err error) { stoppedWith = err },
-			Emit:         func(e monitor.Event) { message = e.Message },
+			StopTunnel: func(err error) {
+				mu.Lock()
+				stoppedWith = err
+				mu.Unlock()
+			},
+			Emit: func(e monitor.Event) {
+				mu.Lock()
+				message = e.Message
+				mu.Unlock()
+			},
 			RecoverLease: func(context.Context, error) (monitor.LeaseRecovery, bool) { return monitor.LeaseRecovery{}, false },
 		},
 	})
@@ -402,15 +432,24 @@ func TestMonitorStopsWhenRecoveryDeclined(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if stoppedWith != nil {
+		mu.Lock()
+		done := stoppedWith != nil
+		mu.Unlock()
+		if done {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if stoppedWith == nil {
+	mu.Lock()
+	failed := stoppedWith == nil
+	mu.Unlock()
+	if failed {
 		t.Fatal("恢复被拒绝时必须停止隧道")
 	}
-	if !strings.Contains(message, "其他设备") {
-		t.Fatalf("界面应看到服务端的业务文案，实际 %q", message)
+	mu.Lock()
+	captured := message
+	mu.Unlock()
+	if !strings.Contains(captured, "其他设备") {
+		t.Fatalf("界面应看到服务端的业务文案，实际 %q", captured)
 	}
 }

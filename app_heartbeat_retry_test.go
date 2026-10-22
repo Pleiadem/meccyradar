@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,11 +21,31 @@ import (
 // 只会把重登时机拖后。
 
 type retryHarness struct {
-	monitor  *monitor.Monitor
-	calls    atomic.Int32
-	stopped  atomic.Bool
+	monitor *monitor.Monitor
+	calls   atomic.Int32
+	stopped atomic.Bool
+	// mu 保护 logs/messages：它们是 monitor goroutine 写的，测试在读。
+	mu       sync.Mutex
 	logs     []string
 	messages []string
+}
+
+func (h *retryHarness) appendLog(message string) {
+	h.mu.Lock()
+	h.logs = append(h.logs, message)
+	h.mu.Unlock()
+}
+
+func (h *retryHarness) appendMessage(message string) {
+	h.mu.Lock()
+	h.messages = append(h.messages, message)
+	h.mu.Unlock()
+}
+
+func (h *retryHarness) joinedLogs() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return strings.Join(h.logs, "\n")
 }
 
 func newRetryHarness(t *testing.T, beat func(call int32) error) *retryHarness {
@@ -37,13 +58,13 @@ func newRetryHarness(t *testing.T, beat func(call int32) error) *retryHarness {
 	mon, err := monitor.New(monitor.Config{
 		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
-		Heartbeater: heartbeatFunc(func(context.Context, string) error {
-			return beat(h.calls.Add(1))
+		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
+			return monitor.HeartbeatResult{}, beat(h.calls.Add(1))
 		}),
 		Hooks: monitor.Hooks{
 			StopTunnel:         func(error) { h.stopped.Store(true) },
-			Log:                func(m string) { h.logs = append(h.logs, m) },
-			Emit:               func(e monitor.Event) { h.messages = append(h.messages, e.Message) },
+			Log:                h.appendLog,
+			Emit:               func(e monitor.Event) { h.appendMessage(e.Message) },
 			RetryableHeartbeat: isRetryableHeartbeat,
 			RecoverLease: func(context.Context, error) (monitor.LeaseRecovery, bool) {
 				return monitor.LeaseRecovery{}, false
@@ -91,7 +112,7 @@ func TestHeartbeatTimeoutRetriesThenStops(t *testing.T) {
 	if got := h.calls.Load(); got != wantCalls {
 		t.Fatalf("应共尝试 %d 次心跳，实际 %d 次", wantCalls, got)
 	}
-	joined := strings.Join(h.logs, "\n")
+	joined := h.joinedLogs()
 	if !strings.Contains(joined, "心跳连续失败") {
 		t.Fatalf("停止前应有明确日志，实际日志：\n%s", joined)
 	}
@@ -115,8 +136,8 @@ func TestHeartbeatTimeoutRecoversOnRetry(t *testing.T) {
 	if h.stopped.Load() {
 		t.Fatal("重试成功时不能停止隧道")
 	}
-	if !strings.Contains(strings.Join(h.logs, "\n"), "心跳已恢复") {
-		t.Fatalf("恢复后应有日志，实际：%v", h.logs)
+	if !strings.Contains(h.joinedLogs(), "心跳已恢复") {
+		t.Fatalf("恢复后应有日志，实际：%v", h.joinedLogs())
 	}
 }
 
@@ -130,9 +151,9 @@ func TestHeartbeatUnauthorizedSkipsRetry(t *testing.T) {
 	mon, err := monitor.New(monitor.Config{
 		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
-		Heartbeater: heartbeatFunc(func(context.Context, string) error {
+		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			calls.Add(1)
-			return &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTTL, Message: "登录状态已超时"}
+			return monitor.HeartbeatResult{}, &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTTL, Message: "登录状态已超时"}
 		}),
 		Hooks: monitor.Hooks{
 			RetryableHeartbeat: isRetryableHeartbeat,
@@ -173,9 +194,9 @@ func TestHeartbeatTakeoverSkipsRetry(t *testing.T) {
 	mon, err := monitor.New(monitor.Config{
 		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
-		Heartbeater: heartbeatFunc(func(context.Context, string) error {
+		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			calls.Add(1)
-			return &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTakeover, Message: "该卡密已在其他设备登录，本机已停止"}
+			return monitor.HeartbeatResult{}, &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTakeover, Message: "该卡密已在其他设备登录，本机已停止"}
 		}),
 		Hooks: monitor.Hooks{
 			RetryableHeartbeat: isRetryableHeartbeat,
@@ -214,11 +235,11 @@ func TestRetryAbortsWhenErrorBecomesBusiness(t *testing.T) {
 	mon, err := monitor.New(monitor.Config{
 		ServerAddr: "node.example", ServerPort: 7000, LocalAddr: "127.0.0.1:1",
 		LeaseID: "lease-1", HeartbeatInterval: time.Hour, ExpireAtUnix: 1893456000,
-		Heartbeater: heartbeatFunc(func(context.Context, string) error {
+		Heartbeater: heartbeatFunc(func(context.Context, string) (monitor.HeartbeatResult, error) {
 			if calls.Add(1) == 1 {
-				return networkErr()
+				return monitor.HeartbeatResult{}, networkErr()
 			}
-			return &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTTL, Message: "登录状态已超时"}
+			return monitor.HeartbeatResult{}, &auth.StatusError{Status: 401, Reason: auth.LeaseReasonTTL, Message: "登录状态已超时"}
 		}),
 		Hooks: monitor.Hooks{
 			RetryableHeartbeat: isRetryableHeartbeat,

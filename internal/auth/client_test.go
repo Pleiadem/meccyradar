@@ -38,7 +38,7 @@ func TestLoginHeartbeatLogoutAndConflict(t *testing.T) {
 	if data.FRPConfig.ServerAddr != "node.example" || data.Session.LeaseID != "lease-1" {
 		t.Fatalf("unexpected data: %+v", data)
 	}
-	if err := client.Heartbeat(context.Background(), data.Session.LeaseID); err != nil {
+	if _, err := client.Heartbeat(context.Background(), data.Session.LeaseID); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.Logout(context.Background(), data.Session.LeaseID); err != nil {

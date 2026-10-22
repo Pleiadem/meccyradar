@@ -115,6 +115,8 @@ type App struct {
 	lease leaseGuard
 	// logEmitter 是测试用的日志出口；生产为 nil，走 runtime.EventsEmit。
 	logEmitter func(LogEventDTO)
+	// leaseRetryBackoff 是重登退避间隔；0 表示用默认值。测试里调小用。
+	leaseRetryBackoff time.Duration
 }
 
 // resolveManagementURL returns the management endpoint, defaulting to the real
@@ -503,6 +505,8 @@ func (a *App) startTunnel() error {
 			RecoverLease: a.recoverLease,
 			// 网络类心跳失败先退避重试 3 次，别把 Wi-Fi 切换当成掉线。
 			RetryableHeartbeat: isRetryableHeartbeat,
+			// 心跳带回权威到期时间：管理员改期限后客户端据此跟上。
+			UpdateExpiry: a.applyServerExpiry,
 			RestartTunnel: func() {
 				// 重登后配置变了（换服/换端口），必须重建 FRPC。
 				go func() { _ = a.restartTunnelAfterRecovery() }()

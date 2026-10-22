@@ -10,6 +10,8 @@ import (
 	"meccyradar/internal/auth"
 	"meccyradar/internal/config"
 	"meccyradar/internal/monitor"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // 租约自愈的边界。
@@ -32,9 +34,11 @@ const (
 	leaseTTL = 90 * time.Second
 )
 
-// leaseRecoverBackoff 是两次重登之间的退避间隔。
-// 用变量而不是常量，测试里调小才不用真的等 6 秒。
-var leaseRecoverBackoff = 2 * time.Second
+// defaultLeaseRecoverBackoff 是两次重登之间的默认退避间隔。
+//
+// 用 App 字段（leaseBackoff）而不是包级变量：包级变量被测试改动时，
+// 其他用例残留的 goroutine 可能还在读，会被 -race 抓成数据竞争。
+const defaultLeaseRecoverBackoff = 2 * time.Second
 
 // leaseGuard 记录"手上的租约还能不能用"。
 //
@@ -99,21 +103,30 @@ func (g *leaseGuard) stale(now time.Time) bool {
 	return false
 }
 
-// heartbeatTracker 包一层 Heartbeater，把每次心跳结果喂给 leaseGuard。
+// authHeartbeater 是 auth.Client 的心跳签名。
 //
-// monitor 只知道自己心跳成功/失败，不知道"租约还剩多久"；
-// 而 startTunnel 恰恰需要这个信息才能避免拿过期租约去启动。
+// monitor.Heartbeater 用的是 monitor.HeartbeatResult（避免 monitor 依赖 auth
+// 的响应结构），所以这里做一层适配。
+type authHeartbeater interface {
+	Heartbeat(ctx context.Context, leaseID string) (auth.HeartbeatResponse, error)
+}
+
+// heartbeatTracker 包一层 Heartbeater，把每次心跳结果喂给 leaseGuard，
+// 并把 auth 的响应翻译成 monitor 的结果类型。
 type heartbeatTracker struct {
-	inner    monitor.Heartbeater
+	inner    authHeartbeater
 	onResult func(err error)
 }
 
-func (t *heartbeatTracker) Heartbeat(ctx context.Context, leaseID string) error {
-	err := t.inner.Heartbeat(ctx, leaseID)
+func (t *heartbeatTracker) Heartbeat(ctx context.Context, leaseID string) (monitor.HeartbeatResult, error) {
+	response, err := t.inner.Heartbeat(ctx, leaseID)
 	if t.onResult != nil {
 		t.onResult(err)
 	}
-	return err
+	if err != nil {
+		return monitor.HeartbeatResult{}, err
+	}
+	return monitor.HeartbeatResult{ExpiresAt: response.ExpiresAt, LeaseID: response.LeaseID}, nil
 }
 
 // isRetryableHeartbeat 判断心跳失败是否属于网络类（值得退避重试）。
@@ -185,7 +198,7 @@ func (a *App) recoverLease(ctx context.Context, cause error) (monitor.LeaseRecov
 	var lastErr error
 	for attempt := 1; attempt <= leaseRecoverAttempts; attempt++ {
 		if attempt > 1 {
-			delay := time.Duration(attempt-1) * leaseRecoverBackoff
+			delay := time.Duration(attempt-1) * a.leaseBackoff()
 			select {
 			case <-ctx.Done():
 				return monitor.LeaseRecovery{}, false
@@ -269,6 +282,54 @@ func frpConfigEqual(left, right auth.FRPConfig) bool {
 		}
 	}
 	return true
+}
+
+// leaseBackoff 返回两次重登之间的退避间隔。
+func (a *App) leaseBackoff() time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.leaseRetryBackoff <= 0 {
+		return defaultLeaseRecoverBackoff
+	}
+	return a.leaseRetryBackoff
+}
+
+// applyServerExpiry 用心跳带回的权威到期时间刷新内存与界面。
+//
+// 管理员在后台改期限后，客户端最多在下一个心跳周期（30 秒）内跟上：
+// 本地 ExpireAtUnix 变了，每秒一次的到期检查自然就会在下一个 tick
+// 判定过期并停掉隧道，不需要用户重启客户端。
+//
+// 界面靠 session:restored 推送新的 InitState：前端用它更新 expireAtUnix，
+// 再按秒重算倒计时。只改后端不推事件的话，倒计时会一直显示旧值。
+func (a *App) applyServerExpiry(expireAtUnix int64) {
+	if expireAtUnix <= 0 {
+		return
+	}
+	a.mu.Lock()
+	if a.authData != nil {
+		a.authData.ExpireAtUnix = expireAtUnix
+		a.authData.ExpireAtStr = formatBeijingMinute(expireAtUnix)
+	}
+	ctx := a.ctx
+	a.mu.Unlock()
+
+	a.emitLog("到期时间已更新为 " + formatBeijingMinute(expireAtUnix))
+	if ctx != nil {
+		// GetInitState 自己会加锁，必须放在解锁之后调。
+		runtime.EventsEmit(ctx, "session:restored", a.GetInitState())
+	}
+}
+
+// beijingZone 固定 +08:00。
+//
+// 不能用 time.Local：用户机器可能不在东八区，那样到期时间会显示成
+// 用户本地时区，与服务端下发的 +08:00 对不上。
+var beijingZone = time.FixedZone("CST", 8*3600)
+
+// formatBeijingMinute 与服务端 display_minutes 保持一致的展示格式。
+func formatBeijingMinute(unix int64) string {
+	return time.Unix(unix, 0).In(beijingZone).Format("2006-01-02 15:04")
 }
 
 // handleHeartbeatResult 是每次心跳后的回调（由 heartbeatTracker 调用）。

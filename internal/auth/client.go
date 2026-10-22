@@ -169,11 +169,42 @@ func (c *Client) Login(ctx context.Context, cardKey string) (AuthData, error) {
 	return out, nil
 }
 
-func (c *Client) Heartbeat(ctx context.Context, leaseID string) error {
+func (c *Client) Heartbeat(ctx context.Context, leaseID string) (HeartbeatResponse, error) {
 	if strings.TrimSpace(leaseID) == "" {
-		return errors.New("缺少租约 ID")
+		return HeartbeatResponse{}, errors.New("缺少租约 ID")
 	}
-	return c.doJSON(ctx, http.MethodPost, "/api/client/heartbeat", leaseRequest{LeaseID: leaseID}, &struct{}{})
+	var response HeartbeatResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/api/client/heartbeat", leaseRequest{LeaseID: leaseID}, &response); err != nil {
+		return HeartbeatResponse{}, err
+	}
+	return response, nil
+}
+
+// HeartbeatResponse 是心跳返回的信息。
+//
+// ExpiresAt 是**权威**的卡密到期时间：管理员在后台改了期限，客户端
+// 只能从下一次心跳得知。旧服务端不返回这个字段，此时 ExpiresAt 为空，
+// 调用方保持原有本地值不变。
+type HeartbeatResponse struct {
+	Status    string `json:"status"`
+	ExpiresAt string `json:"expires_at"`
+	LeaseID   string `json:"lease_id,omitempty"`
+}
+
+// ParseExpiresAt 把 ISO 8601 的 expires_at 解析成 Unix 时间戳。
+//
+// 空串或格式不对一律返回 0，调用方据此"不更新"而不是把到期时间
+// 当成 0（那会让客户端立刻判定已过期、把正常用户踢下线）。
+func ParseExpiresAt(value string) int64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return 0
+	}
+	return parsed.Unix()
 }
 
 func (c *Client) Logout(ctx context.Context, leaseID string) error {

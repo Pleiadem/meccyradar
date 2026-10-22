@@ -15,11 +15,11 @@ type fakeHeartbeat struct {
 	err   error
 }
 
-func (f *fakeHeartbeat) Heartbeat(context.Context, string) error {
+func (f *fakeHeartbeat) Heartbeat(context.Context, string) (HeartbeatResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	return f.err
+	return HeartbeatResult{}, f.err
 }
 
 func TestMonitorMeasuresPingsAndProbesPort(t *testing.T) {

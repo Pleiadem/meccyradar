@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"meccyradar/internal/auth"
 )
 
 type Status string
@@ -40,8 +42,16 @@ type Event struct {
 	At   time.Time
 }
 
+// HeartbeatResult 是心跳成功后服务端带回的信息。
+type HeartbeatResult struct {
+	// ExpiresAt 是 ISO 8601 的卡密到期时间；空表示服务端没下发（旧版本）。
+	ExpiresAt string
+	// LeaseID 便于日志追踪，客户端不依赖它。
+	LeaseID string
+}
+
 type Heartbeater interface {
-	Heartbeat(context.Context, string) error
+	Heartbeat(context.Context, string) (HeartbeatResult, error)
 }
 
 type Hooks struct {
@@ -60,6 +70,11 @@ type Hooks struct {
 	// 只有网络类才重试。业务错误（401/403/409）重试没有任何意义：
 	// 租约失效了再发一百次也是 401，反而把重登时机拖后。
 	RetryableHeartbeat func(err error) bool
+	// UpdateExpiry 在心跳带回权威到期时间时被调用。
+	//
+	// 管理员在后台改期限，客户端只能从心跳得知。没有这个回调，
+	// 延长了用户仍到点被踢，改成过期了用户还能一直用到重启。
+	UpdateExpiry func(newExpireAtUnix int64)
 	// RestartTunnel 在重登后 FRPC 配置发生变化时调用。
 	// 配置没变就不要调：停一次隧道会让用户看到界面闪断。
 	RestartTunnel func()
@@ -118,16 +133,23 @@ const (
 	heartbeatRetryAttempts = 3
 )
 
-// heartbeatRetryBackoff 是第一次重试前的等待，之后每次翻倍（2s/4s/8s）。
-// 用变量而不是常量，测试里调小才不用真的等 14 秒。
-var heartbeatRetryBackoff = 2 * time.Second
+// heartbeatRetryBackoffNanos 是第一次重试前的等待，之后每次翻倍（2s/4s/8s）。
+//
+// 用 atomic 而不是普通变量：测试会调小它，而其他用例的 monitor goroutine
+// 可能还在读，普通变量会被 -race 抓成数据竞争。
+var heartbeatRetryBackoffNanos atomic.Int64
+
+func init() { heartbeatRetryBackoffNanos.Store(int64(2 * time.Second)) }
+
+// heartbeatRetryBackoff 返回当前退避间隔。
+func heartbeatRetryBackoff() time.Duration {
+	return time.Duration(heartbeatRetryBackoffNanos.Load())
+}
 
 // SetHeartbeatRetryBackoffForTest 让测试把退避间隔调小。
 // 返回原值，调用方负责在 Cleanup 里还原。
 func SetHeartbeatRetryBackoffForTest(value time.Duration) time.Duration {
-	previous := heartbeatRetryBackoff
-	heartbeatRetryBackoff = value
-	return previous
+	return time.Duration(heartbeatRetryBackoffNanos.Swap(int64(value)))
 }
 
 // HeartbeatRetryAttempts 暴露重试次数给测试断言用。
@@ -145,6 +167,9 @@ type Monitor struct {
 	// leaseID 会随静默重登更新，所以不能只放在 cfg 里（cfg 是值拷贝）。
 	// 只在 monitor 自己的 goroutine 里读写。
 	leaseID string
+	// expireAtUnix 是当前生效的卡密到期时间。心跳会把它刷新成服务端下发的
+	// 权威值，而 expiresIn() 每秒被读一次，所以必须走 mu 保护。
+	expireAtUnix int64
 }
 
 func New(cfg Config) (*Monitor, error) {
@@ -178,7 +203,7 @@ func New(cfg Config) (*Monitor, error) {
 	if cfg.ExpireAtUnix <= 0 {
 		return nil, errors.New("缺少到期时间")
 	}
-	return &Monitor{cfg: cfg, leaseID: cfg.LeaseID}, nil
+	return &Monitor{cfg: cfg, leaseID: cfg.LeaseID, expireAtUnix: cfg.ExpireAtUnix}, nil
 }
 
 func (m *Monitor) Start() error {
@@ -190,6 +215,7 @@ func (m *Monitor) Start() error {
 	// 每次启动都从 cfg 重新取一次租约：同一张 Monitor 不会被复用，
 	// 但如果调用方在 Start 之前改了 cfg.LeaseID，这里要跟上。
 	m.leaseID = m.cfg.LeaseID
+	m.expireAtUnix = m.cfg.ExpireAtUnix
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.done = make(chan struct{})
@@ -433,7 +459,8 @@ func (m *Monitor) heartbeat(ctx context.Context) bool {
 	if m.cfg.Heartbeater == nil || m.leaseID == "" {
 		return true
 	}
-	if err := m.cfg.Heartbeater.Heartbeat(ctx, m.leaseID); err != nil {
+	result, err := m.cfg.Heartbeater.Heartbeat(ctx, m.leaseID)
+	if err != nil {
 		// 网络类失败先原地重试：笔记本合盖唤醒、Wi-Fi 切换、临时丢包
 		// 都会让一两次心跳超时，这时候把隧道停掉纯属误伤。
 		if m.shouldRetryHeartbeat(err) && m.retryHeartbeat(ctx, err) {
@@ -448,6 +475,9 @@ func (m *Monitor) heartbeat(ctx context.Context) bool {
 		m.stopTunnel(err)
 		return false
 	}
+	// 心跳成功顺手刷新权威到期时间：管理员在后台改了期限，
+	// 下一次心跳就能让本地判断跟上，不需要用户重启客户端。
+	m.applyExpiresAt(result.ExpiresAt)
 	return true
 }
 
@@ -465,7 +495,7 @@ func (m *Monitor) shouldRetryHeartbeat(err error) bool {
 // 退避 2s / 4s / 8s，共 heartbeatRetryAttempts 次。重试期间**不动隧道状态**：
 // 隧道还在跑，只是心跳这一路暂时不通，界面保持"运行中"比闪成错误更准确。
 func (m *Monitor) retryHeartbeat(ctx context.Context, cause error) bool {
-	delay := heartbeatRetryBackoff
+	delay := heartbeatRetryBackoff()
 	for attempt := 1; attempt <= heartbeatRetryAttempts; attempt++ {
 		m.log(fmt.Sprintf("心跳失败，%s 后重试（%d/%d）：%s",
 			delay.Round(time.Millisecond), attempt, heartbeatRetryAttempts, heartbeatFailureMessage(cause)))
@@ -475,8 +505,11 @@ func (m *Monitor) retryHeartbeat(ctx context.Context, cause error) bool {
 			return false
 		case <-time.After(delay):
 		}
-		if err := m.cfg.Heartbeater.Heartbeat(ctx, m.leaseID); err == nil {
+		if result, err := m.cfg.Heartbeater.Heartbeat(ctx, m.leaseID); err == nil {
 			m.log("心跳已恢复")
+			// 重试成功同样要刷新到期时间，否则管理员改期限后
+			// 用户要等到下一次正常心跳才知道。
+			m.applyExpiresAt(result.ExpiresAt)
 			return true
 		} else {
 			cause = err
@@ -545,7 +578,45 @@ func (m *Monitor) expiresIn() int64 {
 	//
 	// 会话真实失效由心跳失败承担：heartbeat() 收到错误会停止隧道，
 	// 所以这里不做租约上限也不会无限续期。
-	return m.cfg.ExpireAtUnix - m.cfg.Now().Unix()
+	//
+	// expireAtUnix 会被心跳刷新（管理员改期限），expiresIn 每秒读一次，
+	// 所以必须加锁——否则是数据竞争。
+	m.mu.Lock()
+	expireAt := m.expireAtUnix
+	m.mu.Unlock()
+	return expireAt - m.cfg.Now().Unix()
+}
+
+// parseExpiresAt 解析 ISO 8601 到期时间。
+//
+// 复用 auth 的实现而不是在这里重写：两处解析规则一旦不一致，
+// 就会出现"服务端下发了但客户端读不出来"这种很难查的问题。
+func parseExpiresAt(value string) int64 { return auth.ParseExpiresAt(value) }
+
+// RemainingSeconds 返回距离卡密到期的剩余秒数（可为负）。
+//
+// 导出给测试与上层查询用；内部每秒的到期检查走 expiresIn。
+func (m *Monitor) RemainingSeconds() int64 { return m.expiresIn() }
+
+// applyExpiresAt 用服务端下发的权威到期时间刷新本地值。
+//
+// 空串/格式错误一律忽略：把解析失败当成"到期时间为 0"会让客户端
+// 立刻判定已过期，把正常用户踢下线——宁可保持旧值。
+func (m *Monitor) applyExpiresAt(value string) {
+	unix := parseExpiresAt(value)
+	if unix <= 0 {
+		return
+	}
+	m.mu.Lock()
+	changed := m.expireAtUnix != unix
+	m.expireAtUnix = unix
+	m.mu.Unlock()
+	if !changed {
+		return
+	}
+	if m.cfg.Hooks.UpdateExpiry != nil {
+		m.cfg.Hooks.UpdateExpiry(unix)
+	}
 }
 
 func (m *Monitor) stopTunnel(err error) {
