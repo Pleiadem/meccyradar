@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="meccy-aurora" x1="38" y1="32" x2="472" y2="488" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8588F5"/>
+      <stop offset="0.34" stop-color="#55C9E8"/>
+      <stop offset="0.68" stop-color="#5BE5C1"/>
+      <stop offset="1" stop-color="#C5F69A"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#meccy-aurora)"/>
+  <path d="M112 342V170H164L256 276L348 170H400V342H344V252L256 334L168 252V342H112Z" fill="#101116"/>
+  <circle cx="384" cy="108" r="20" fill="#F8FFFC"/>
+</svg>
