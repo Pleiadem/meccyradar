@@ -113,6 +113,8 @@ type App struct {
 	initErr       error
 	// lease 记录手上的租约还能不能用，供 StartTunnel 判断要不要先重登。
 	lease leaseGuard
+	// logEmitter 是测试用的日志出口；生产为 nil，走 runtime.EventsEmit。
+	logEmitter func(LogEventDTO)
 }
 
 // resolveManagementURL returns the management endpoint, defaulting to the real
@@ -693,7 +695,10 @@ func (a *App) emitDiagnosis(message string) {
 // 端口占用这类问题 FRPC 只写日志、不退出，所以必须在日志流里识别，
 // 否则用户只能自己从英文日志里找原因。
 func (a *App) handleEngineLog(line string) {
-	a.emitLog(line)
+	// 先剥掉 FRPC 自带的日期时间与 run id，界面只保留自己的 HH:MM:SS。
+	clean := sanitizeEngineLog(line)
+	a.emitLog(clean)
+	// 诊断仍用原始行：分类规则是照着 FRPC 原文写的，剥过的行可能匹配不上。
 	if diagnosis.IsRecognized(line) {
 		a.emitDiagnosis(line)
 	}
@@ -702,9 +707,15 @@ func (a *App) handleEngineLog(line string) {
 func (a *App) emitLog(message string) {
 	a.mu.Lock()
 	ctx := a.ctx
+	emitter := a.logEmitter
 	a.mu.Unlock()
+	event := LogEventDTO{Message: message, At: logClock(time.Now())}
+	if emitter != nil {
+		emitter(event)
+		return
+	}
 	if ctx != nil {
-		runtime.EventsEmit(ctx, "log:append", LogEventDTO{Message: message, At: time.Now().Format(time.RFC3339)})
+		runtime.EventsEmit(ctx, "log:append", event)
 	}
 }
 
