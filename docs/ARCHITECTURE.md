@@ -301,15 +301,19 @@ auth.Client.Heartbeat(leaseId) → POST /api/client/heartbeat
 
 设置面板的「更换服务器」调用 `POST /api/client/change-server`，请求带 `cardKey + leaseId`。
 服务端复用登录的卡密校验，且要求 leaseId 是该卡未过期的 active 租约。每卡 60 秒冷却。
+客户端只发起换服请求并接收服务端返回的新 envelope；服务器负责目标服务器、端口、Panel 用户和 Token。
+RentForge 在返回 envelope 前等待新用户出现在 Panel 读取/鉴权索引，客户端不负责等待同步或创建资源。
 
 成功语义是「新激活，但保留期限」：新选另一台可用服务器，生成新用户名、token、端口，
-`expires_at` 和备注沿用原卡；本地切到新资源并签新租约，然后将旧服务器用户 **disable**
-（PATCH `enable=false`，不 DELETE）。成功响应和 `/client/login` 使用相同 envelope，
-客户端复用 `AuthData` 解析，刷新 `leaseGuard` 后自动重连；雷达分享链接随新的 FRP 地址/端口更新。
+`expires_at` 和备注沿用原卡；本地切到新资源并签新租约，然后删除旧服务器用户。
+成功响应和 `/client/login` 使用相同 envelope，并可能携带 `warning`；客户端复用 `AuthData`
+解析，刷新 `leaseGuard` 后自动重连；雷达分享链接随新的 FRP 地址/端口更新，用户必须重新复制最新链接。
 
-如果旧用户 disable 失败，换服仍成功，但 `frps_migration_cleanups.cleanup_action=disable`
-持久化待办，管理端 retry endpoint 会重试 **PATCH enable=false**，不会 DELETE。
-后台 `migrate_card` 遗留待办的 `cleanup_action=delete` 保持原有 DELETE 语义。
+如果旧用户删除失败，换服仍可能已经成功，但服务端会返回 warning，并以
+`cleanup_action=delete` 持久化待办，管理端 retry endpoint 会重试 **DELETE**。本地提交失败时
+不能删除旧资源；目标资源补偿失败时必须保留可恢复的 cleanup 意图。
+后台 `migrate_card` 也是目标提交成功后删除旧用户，和客户端自助换服的区别主要是目标由管理员指定，
+而客户端自动选择另一台可用服务器。
 
 后台管理端改服（`migrate_card`）则是管理员指定目标服务器，旧用户删除；两者语义不同。
 

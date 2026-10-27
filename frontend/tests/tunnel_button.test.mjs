@@ -14,12 +14,23 @@ import {
   canToggleTunnel,
   isExpired,
   remainingSeconds,
+  remainingTimeLabel,
   tunnelButtonHint,
   tunnelButtonLabel,
 } from '../src/tunnel_button.js'
 
 const future = () => Math.floor(Date.now() / 1000) + 3600
 const past = () => Math.floor(Date.now() / 1000) - 60
+
+test('剩余时间显示区分未知、刚登录与已到期', () => {
+  assert.equal(remainingTimeLabel({ authenticated: true }), '获取中…')
+  assert.equal(remainingTimeLabel({ authenticated: true, expireAtUnix: 0 }), '获取中…')
+  assert.match(remainingTimeLabel({ authenticated: true, expireAtUnix: future() }), /小时/)
+  assert.notEqual(remainingTimeLabel({ authenticated: true, expireAtUnix: future() }), '已到期')
+  assert.equal(remainingTimeLabel({ authenticated: true, expireAtUnix: past() }), '已到期')
+  assert.equal(remainingTimeLabel({ authenticated: true, expiresIn: 0 }), '已到期')
+  assert.equal(remainingTimeLabel({ authenticated: true, expiresIn: 7200, expireAtUnix: past() }), '2小时 0分钟')
+})
 
 test('到期前 + 空闲 → 连接按钮可点', () => {
   const state = { authenticated: true, tunnelStatus: 'idle', expiresIn: 3600 }

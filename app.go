@@ -63,6 +63,7 @@ type AuthResultDTO struct {
 	ExpireAtStr  string `json:"expireAtStr"`
 	ExpireAtUnix int64  `json:"expireAtUnix"`
 	TunnelStatus string `json:"tunnelStatus"`
+	Warning      string `json:"warning,omitempty"`
 }
 
 type TunnelStatusDTO struct {
@@ -102,13 +103,30 @@ type appDependencies struct {
 	autostart autostartManager
 }
 
+type loginAttempt struct {
+	cardKey    string
+	generation uint64
+	waiters    int
+	done       chan struct{}
+	data       auth.AuthData
+	err        error
+}
+
 type App struct {
 	ctx context.Context
 
-	mu       sync.Mutex
-	deps     appDependencies
-	authData *auth.AuthData
-	cardKey  string
+	mu               sync.Mutex
+	changeMu         sync.Mutex
+	loginMu          sync.Mutex
+	loginInFlight    *loginAttempt
+	loginGeneration  uint64
+	logoutInProgress bool
+	// Test hooks make lifecycle race windows deterministic without affecting production.
+	loginBeforeJoin   func(string)
+	loginBeforeCommit func()
+	deps              appDependencies
+	authData          *auth.AuthData
+	cardKey           string
 	// 雷达密码：来自界面输入，随会话持久化，重启后自动带出。
 	radarPassword string
 	engine        *frpengine.Engine
@@ -119,6 +137,8 @@ type App struct {
 	lease leaseGuard
 	// logEmitter 是测试用的日志出口；生产为 nil，走 runtime.EventsEmit。
 	logEmitter func(LogEventDTO)
+	// diagnosisEmitter mirrors logEmitter for recovery-message tests.
+	diagnosisEmitter func(string)
 	// leaseRetryBackoff 是重登退避间隔；0 表示用默认值。测试里调小用。
 	leaseRetryBackoff time.Duration
 	// 本地端口探测循环（app_port.go）。与隧道无关，登录后一直跑。
@@ -129,6 +149,15 @@ type App struct {
 	// portProbeInterval 是该 App 的探测周期；零值使用默认 2 秒。实例字段避免
 	// 测试改包级 interval 时与另一个用例尚未退出的探测 goroutine 产生 race。
 	portProbeInterval time.Duration
+	// version gate is verified before any session restoration or tunnel operation.
+	versionGate         bool
+	versionInfo         auth.VersionInfo
+	versionGateState    versionGateState
+	versionCheckPending bool
+	versionCheckError   string
+	versionCheckMu      sync.Mutex
+	versionUseMu        sync.RWMutex
+	versionStateFile    string
 	// autostartMode 表示本次是开机自启拉起来的：窗口隐藏、自动登录并连隧道。
 	autostartMode bool
 }
@@ -171,6 +200,8 @@ func (a *App) startup(ctx context.Context) {
 	a.mu.Lock()
 	a.ctx = ctx
 	a.mu.Unlock()
+	// 已持久化的强制要求在网络检查启动前同步加载，离线时也不会被绕过。
+	a.loadLocalVersionGate()
 	// Windows 需要在启动时就挂上托盘：窗口关闭后是隐藏而非退出，
 	// 没有托盘就再也点不回来了。
 	a.startTray()
@@ -181,6 +212,11 @@ func (a *App) startup(ctx context.Context) {
 	// 开机自启拉起时自动恢复会话并连接；普通启动沿用同一恢复行为。
 	// StartHidden 由 main.go 控制，startup 时无需再显示/隐藏窗口。
 	go a.restoreCachedSession()
+	go func() {
+		if err := a.CheckVersion(); err != nil {
+			log.Printf("MeccyRadar version check did not complete: %v", err)
+		}
+	}()
 }
 
 // handleProcessSignals 兜住 SIGINT/SIGTERM 这类非界面退出路径。
@@ -353,29 +389,50 @@ func (a *App) SaveRadarPassword(password string) error {
 	})
 }
 
+var errSessionAlreadyAuthenticated = errors.New("当前已登录，请先退出当前会话")
+
 func (a *App) restoreCachedSession() {
+	a.versionUseMu.RLock()
+	if a.versionBlocked() {
+		a.versionUseMu.RUnlock()
+		return
+	}
 	a.mu.Lock()
+	// A manual login may have completed just before this background restoration
+	// began. Do not issue another lease that would invalidate that live monitor;
+	// this is only a duplicate-operation guard, not server-side lease validation.
+	if a.authData != nil {
+		a.mu.Unlock()
+		a.versionUseMu.RUnlock()
+		return
+	}
 	store, client, initErr := a.deps.store, a.deps.client, a.initErr
 	a.mu.Unlock()
 	if initErr != nil || store == nil || client == nil {
+		a.versionUseMu.RUnlock()
 		return
 	}
 	session, err := store.Load()
 	if err != nil {
+		a.versionUseMu.RUnlock()
 		return
 	}
-	data, err := client.Login(context.Background(), session.CardKey)
+	if hook := a.loginBeforeJoin; hook != nil {
+		hook(session.CardKey)
+	}
+	_, err = a.loginOnce(client, session)
 	if err != nil {
+		a.versionUseMu.RUnlock()
+		// A manual login can commit after the initial duplicate-operation check.
+		// In that ordering restore lost the race benignly; do not publish this
+		// expected state transition as a tunnel error to the UI.
+		if errors.Is(err, errSessionAlreadyAuthenticated) {
+			return
+		}
 		a.emitStatus("error", 0, err.Error(), false, false)
 		return
 	}
-	a.mu.Lock()
-	a.cardKey = session.CardKey
-	// 雷达密码也要回填：否则自动登录后界面是空的，
-	// 复制出的链接会缺 k= 参数。
-	a.radarPassword = session.RadarPassword
-	a.authData = &data
-	a.mu.Unlock()
+	a.versionUseMu.RUnlock()
 	// 与手动登录相同：只有 Wails 运行时已启动才开探测循环。
 	// 测试直接调用 restoreCachedSession() 时没有 ctx，不应泄漏后台 goroutine。
 	a.mu.Lock()
@@ -439,7 +496,101 @@ func (a *App) GetInitState() InitStateDTO {
 	return state
 }
 
+// loginOnce coalesces restoration/manual login and owns the single session commit.
+// The in-flight marker remains present until authData and the credential store have
+// been committed, so a late caller cannot create a second server lease in the gap.
+func (a *App) loginOnce(client *auth.Client, session config.Session) (auth.AuthData, error) {
+	cardKey := session.CardKey
+	a.loginMu.Lock()
+	if a.logoutInProgress {
+		a.loginMu.Unlock()
+		return auth.AuthData{}, errors.New("正在退出登录，请稍后重试")
+	}
+	if attempt := a.loginInFlight; attempt != nil {
+		if attempt.cardKey != cardKey {
+			a.loginMu.Unlock()
+			return auth.AuthData{}, errors.New("正在恢复其他会话，请稍后重试")
+		}
+		attempt.waiters++
+		done := attempt.done
+		a.loginMu.Unlock()
+		<-done
+		return attempt.data, attempt.err
+	}
+	// Atomically couple the no-active-session check with reserving this attempt.
+	// This closes the gap where a caller passed its outer check, paused, and then
+	// arrived after another caller had committed and cleared loginInFlight.
+	a.mu.Lock()
+	hasSession := a.authData != nil
+	a.mu.Unlock()
+	if hasSession {
+		a.loginMu.Unlock()
+		return auth.AuthData{}, errSessionAlreadyAuthenticated
+	}
+	attempt := &loginAttempt{cardKey: cardKey, generation: a.loginGeneration, done: make(chan struct{})}
+	a.loginInFlight = attempt
+	a.loginMu.Unlock()
+
+	data, err := client.Login(context.Background(), cardKey)
+	if hook := a.loginBeforeCommit; hook != nil {
+		hook()
+	}
+
+	a.loginMu.Lock()
+	if err == nil && (attempt.generation != a.loginGeneration || a.logoutInProgress) {
+		err = errors.New("登录已取消，请重新操作")
+	}
+	if err == nil && a.versionBlocked() {
+		err = errors.New("此版本已停止使用，请更新后继续")
+	}
+	if err == nil {
+		a.mu.Lock()
+		store := a.deps.store
+		radarPassword := session.RadarPassword
+		if radarPassword == "" {
+			radarPassword = a.radarPassword
+		}
+		a.mu.Unlock()
+		if store == nil {
+			err = errors.New("凭据存储不可用")
+		} else {
+			err = store.Save(config.Session{CardKey: cardKey, SavedAtUnix: time.Now().Unix(), RadarPassword: radarPassword})
+		}
+		if err == nil {
+			a.mu.Lock()
+			a.cardKey = cardKey
+			a.radarPassword = radarPassword
+			a.authData = &data
+			a.lastStatus = "idle"
+			a.mu.Unlock()
+			a.lease.markHealthy(time.Now())
+		}
+	}
+	attempt.data, attempt.err = data, err
+	a.loginInFlight = nil
+	close(attempt.done)
+	a.loginMu.Unlock()
+
+	// A successful server response rejected locally (for example because Logout
+	// won the race) still created a remote lease; release this exact response.
+	if err != nil && data.Session.LeaseID != "" {
+		_ = client.Logout(context.Background(), data.Session.LeaseID)
+	}
+	return data, err
+}
+
 func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
+	a.mu.Lock()
+	if a.authData != nil {
+		a.mu.Unlock()
+		return AuthResultDTO{}, errSessionAlreadyAuthenticated
+	}
+	a.mu.Unlock()
+	a.versionUseMu.RLock()
+	defer a.versionUseMu.RUnlock()
+	if a.versionBlocked() {
+		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
+	}
 	if strings.TrimSpace(cardKey) == "" {
 		return AuthResultDTO{}, errors.New("请输入卡密")
 	}
@@ -452,7 +603,18 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	if client == nil || store == nil {
 		return AuthResultDTO{}, errors.New("应用依赖未配置")
 	}
-	data, err := client.Login(context.Background(), cardKey)
+	a.mu.Lock()
+	radarPassword := a.radarPassword
+	a.mu.Unlock()
+	if radarPassword == "" {
+		if saved, loadErr := store.Load(); loadErr == nil && saved.CardKey == cardKey {
+			radarPassword = saved.RadarPassword
+		}
+	}
+	if hook := a.loginBeforeJoin; hook != nil {
+		hook(cardKey)
+	}
+	data, err := a.loginOnce(client, config.Session{CardKey: cardKey, RadarPassword: radarPassword})
 	if err != nil {
 		var conflictErr *auth.ConflictError
 		if errors.As(err, &conflictErr) {
@@ -460,24 +622,7 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 		}
 		return AuthResultDTO{}, err
 	}
-	// 必须把内存里的雷达密码一起写盘：只写 CardKey 会把已保存的密码抹掉，
-	// 用户下次打开又得重新填。
-	a.mu.Lock()
-	radarPassword := a.radarPassword
-	a.mu.Unlock()
-	if err := store.Save(config.Session{
-		CardKey:       cardKey,
-		SavedAtUnix:   time.Now().Unix(),
-		RadarPassword: radarPassword,
-	}); err != nil {
-		return AuthResultDTO{}, err
-	}
-	a.mu.Lock()
-	a.cardKey = cardKey
-	a.authData = &data
-	a.lastStatus = "idle"
-	a.mu.Unlock()
-	a.lease.markHealthy(time.Now())
+
 	// Wails 的 startup 在生产中一定先设置 ctx；纯 Go 单测没有 UI 事件通道，
 	// 不应因为调用 LoginByCard 就泄漏一个永久后台探测 goroutine。
 	a.mu.Lock()
@@ -491,7 +636,16 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 
 func (a *App) StartTunnel() error { return a.startTunnel() }
 
-func (a *App) startTunnel() error {
+func (a *App) startTunnel() error { return a.startTunnelWithLeaseRefresh(true) }
+
+func (a *App) startTunnelWithoutLeaseRefresh() error { return a.startTunnelWithLeaseRefresh(false) }
+
+func (a *App) startTunnelWithLeaseRefresh(refreshLease bool) error {
+	a.versionUseMu.RLock()
+	defer a.versionUseMu.RUnlock()
+	if a.versionBlocked() {
+		return errors.New("此版本已停止使用，请更新后继续")
+	}
 	a.mu.Lock()
 	if a.authData == nil {
 		a.mu.Unlock()
@@ -507,10 +661,12 @@ func (a *App) startTunnel() error {
 
 	// 休眠一夜/长时间断网后，内存里的租约可能早已过期。直接拿它启动 FRPC
 	// 会得到"start proxy success + 1 秒后心跳 401"的假成功，所以先换新租约。
-	if err := a.refreshStaleLeaseBeforeStart(context.Background()); err != nil {
-		a.emitStatus("error", 0, err.Error(), false, false)
-		a.emitDiagnosis(err.Error())
-		return err
+	if refreshLease {
+		if err := a.refreshStaleLeaseBeforeStart(context.Background()); err != nil {
+			a.emitStatus("error", 0, err.Error(), false, false)
+			a.emitDiagnosis(err.Error())
+			return err
+		}
 	}
 	a.mu.Lock()
 	if a.authData != nil {
@@ -673,6 +829,17 @@ func (a *App) RemeasurePing() error {
 }
 
 func (a *App) Logout() error {
+	// Invalidate any in-flight login before stopping the monitor. Do not hold
+	// loginMu across stopTunnel: monitor recovery can itself be waiting on login.
+	a.loginMu.Lock()
+	a.loginGeneration++
+	a.logoutInProgress = true
+	a.loginMu.Unlock()
+	defer func() {
+		a.loginMu.Lock()
+		a.logoutInProgress = false
+		a.loginMu.Unlock()
+	}()
 	_ = a.stopTunnel()
 	a.stopPortProbe()
 	a.mu.Lock()
@@ -719,7 +886,12 @@ func (a *App) emitDiagnosis(message string) {
 	result := diagnosis.Diagnose(message)
 	a.mu.Lock()
 	ctx := a.ctx
+	emitter := a.diagnosisEmitter
 	a.mu.Unlock()
+	if emitter != nil {
+		emitter(result.Hint)
+		return
+	}
 	if ctx == nil {
 		return
 	}
@@ -744,7 +916,6 @@ func (a *App) handleEngineLog(line string) {
 		return
 	}
 	a.emitLog(clean)
-	// 诊断仍用原始行：分类规则是照着 FRPC 原文写的，剥过的行可能匹配不上。
 	if diagnosis.IsRecognized(line) {
 		a.emitDiagnosis(line)
 	}

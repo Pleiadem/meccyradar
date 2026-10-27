@@ -19,12 +19,15 @@ import (
 // 服务端返回的结构与 /client/login 完全一致，所以客户端直接复用登录解析。
 
 type changeServerMock struct {
-	server     *httptest.Server
-	calls      atomic.Int32
-	failStatus atomic.Int32
-	failDetail atomic.Value // string
-	serverAddr atomic.Value // string，每次登录/换服返回不同的地址
-	leaseSeq   atomic.Int32
+	server          *httptest.Server
+	calls           atomic.Int32
+	failStatus      atomic.Int32
+	failDetail      atomic.Value // string
+	serverAddr      atomic.Value // string，每次登录/换服返回不同的地址
+	leaseSeq        atomic.Int32
+	loginCalls      atomic.Int32
+	rejectReason    atomic.Value // string，首次换服返回的租约失效原因
+	lastChangeLease atomic.Value // string
 }
 
 func newChangeServerMock(t *testing.T) *changeServerMock {
@@ -33,12 +36,26 @@ func newChangeServerMock(t *testing.T) *changeServerMock {
 	m.failStatus.Store(0)
 	m.failDetail.Store("")
 	m.serverAddr.Store("node-a.example")
+	m.rejectReason.Store("")
+	m.lastChangeLease.Store("")
 	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/client/login", "/api/client/change-server":
 			if r.URL.Path == "/api/client/change-server" {
-				m.calls.Add(1)
+				call := m.calls.Add(1)
+				var request struct {
+					LeaseID string `json:"leaseId"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&request)
+				m.lastChangeLease.Store(request.LeaseID)
+				if reason, _ := m.rejectReason.Load().(string); call == 1 && reason != "" {
+					w.WriteHeader(http.StatusUnauthorized)
+					_ = json.NewEncoder(w).Encode(map[string]any{"detail": "登录状态已失效", "reason": reason})
+					return
+				}
+			} else {
+				m.loginCalls.Add(1)
 			}
 			if status := int(m.failStatus.Load()); status != 0 {
 				w.WriteHeader(status)
@@ -135,6 +152,9 @@ func TestChangeServerAdoptsNewEnvelope(t *testing.T) {
 	if result.ExpireAtUnix != before.ExpireAtUnix {
 		t.Fatalf("返回的到期时间应与 envelope 一致")
 	}
+	if got := changeServerSuccessNotice; got != "已更换服务器，请重新复制最新链接" {
+		t.Fatalf("换服成功提示文案不符：%q", got)
+	}
 }
 
 // 失败时保留原配置，并尽量恢复原来的连接状态。
@@ -167,6 +187,40 @@ func TestChangeServerFailureKeepsOldConfig(t *testing.T) {
 	}
 	if after.Session.LeaseID != beforeLease || after.FRPConfig.ServerAddr != beforeAddr {
 		t.Fatal("失败时原配置必须原样保留")
+	}
+}
+
+func TestChangeServerRecoversExpiredLease(t *testing.T) {
+	m := newChangeServerMock(t)
+	app := newChangeServerApp(t, m)
+	t.Cleanup(func() { _ = app.stopTunnel() })
+	oldLease := app.authData.Session.LeaseID
+	m.rejectReason.Store(auth.LeaseReasonTTL)
+	if _, err := app.ChangeServer(); err != nil {
+		t.Fatalf("租约过期应自动登录并换服: %v", err)
+	}
+	if m.loginCalls.Load() != 2 || m.calls.Load() != 2 {
+		t.Fatalf("应重登一次并重试换服一次: login=%d change=%d", m.loginCalls.Load(), m.calls.Load())
+	}
+	lease, _ := m.lastChangeLease.Load().(string)
+	if lease == "" || lease == oldLease {
+		t.Fatal("重试换服必须使用新租约")
+	}
+}
+
+func TestChangeServerDoesNotRecoverTakeoverOrLogout(t *testing.T) {
+	for _, reason := range []string{auth.LeaseReasonTakeover, auth.LeaseReasonLogout, auth.LeaseReasonUnknown} {
+		t.Run(reason, func(t *testing.T) {
+			m := newChangeServerMock(t)
+			app := newChangeServerApp(t, m)
+			m.rejectReason.Store(reason)
+			if _, err := app.ChangeServer(); err == nil {
+				t.Fatal("不应自动恢复此租约")
+			}
+			if m.loginCalls.Load() != 1 || m.calls.Load() != 1 {
+				t.Fatal("不得自动重登或重试换服")
+			}
+		})
 	}
 }
 

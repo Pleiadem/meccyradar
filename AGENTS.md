@@ -29,11 +29,15 @@ make smoke
 npm run build --prefix frontend
 ```
 
-Windows 目标交叉编译：
+Windows 默认构建（必须使用 Wails build tags）：
 
 ```bash
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-H windowsgui -s -w' -o ./build/meccyradar.exe .
+make build
+# 或
+make build-windows
 ```
+
+输出：`./build/meccyradar.exe`。不要直接使用普通 `GOOS=windows go build`，否则 Wails 会因缺少 `production` 构建标签弹出错误。
 
 ## 目录说明
 

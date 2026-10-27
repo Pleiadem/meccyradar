@@ -22,6 +22,19 @@ export function remainingSeconds(state) {
   return 0
 }
 
+/** 剩余时间尚未知晓时不将其显示为已到期。 */
+export function remainingTimeLabel(state) {
+  const hasRemaining = typeof state?.expiresIn === 'number' && Number.isFinite(state.expiresIn)
+  const hasExpiry = typeof state?.expireAtUnix === 'number' && Number.isFinite(state.expireAtUnix) && state.expireAtUnix > 0
+  if (!hasRemaining && !hasExpiry) return '获取中…'
+  const seconds = hasRemaining ? state.expiresIn : Math.max(0, state.expireAtUnix - Math.floor(Date.now() / 1000))
+  if (seconds <= 0) return '已到期'
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  return days > 0 ? `${days}天 ${hours}小时` : `${hours}小时 ${minutes}分钟`
+}
+
 /** 隧道是否处于"已经在跑"的状态。 */
 function isRunning(status) {
   return status === 'connected' || status === 'connecting'

@@ -400,6 +400,27 @@ func TestMonitorUsesRecoveredLease(t *testing.T) {
 }
 
 // monitor 层：RecoverLease 拒绝时照常停止隧道，并把服务端文案报上去。
+func TestMigrateReloginFailureShowsServerChangedHint(t *testing.T) {
+	ls := newLeaseServer(t)
+	app := newRecoveryApp(t, ls)
+	ls.loginFailAlways.Store(true)
+	var hint string
+	app.diagnosisEmitter = func(message string) { hint = message }
+
+	_, ok := app.recoverLease(context.Background(), &auth.StatusError{
+		Status:  401,
+		Reason:  auth.LeaseReasonMigrate,
+		Message: "连接配置已变更",
+	})
+	if ok {
+		t.Fatal("换服后新配置获取失败时应停止自动重试")
+	}
+	if got := hint; got != "请稍后重试；如果问题持续，请联系管理员检查服务器容量和面板状态" {
+		t.Fatalf("迁移后的资源分配失败提示不符：%q", got)
+	}
+}
+
+// monitor 层：RecoverLease 拒绝时照常停止隧道，并把服务端文案报上去。
 func TestMonitorStopsWhenRecoveryDeclined(t *testing.T) {
 	var mu sync.Mutex
 	var stoppedWith error

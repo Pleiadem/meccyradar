@@ -38,7 +38,10 @@ const (
 //
 // 用 App 字段（leaseBackoff）而不是包级变量：包级变量被测试改动时，
 // 其他用例残留的 goroutine 可能还在读，会被 -race 抓成数据竞争。
-const defaultLeaseRecoverBackoff = 2 * time.Second
+const (
+	defaultLeaseRecoverBackoff = 2 * time.Second
+	changeServerSuccessNotice  = "已更换服务器，请重新复制最新链接"
+)
 
 // leaseGuard 记录"手上的租约还能不能用"。
 //
@@ -165,6 +168,11 @@ func leaseFailureReason(err error) (string, bool) {
 //
 // 返回 ok=false 时 monitor 会照常停止隧道并上报错误文案。
 func (a *App) recoverLease(ctx context.Context, cause error) (monitor.LeaseRecovery, bool) {
+	a.versionUseMu.RLock()
+	defer a.versionUseMu.RUnlock()
+	if a.versionBlocked() {
+		return monitor.LeaseRecovery{}, false
+	}
 	reason, isLeaseFailure := leaseFailureReason(cause)
 	if !isLeaseFailure {
 		// 网络类失败：本轮不改语义，直接停止。
@@ -222,6 +230,16 @@ func (a *App) recoverLease(ctx context.Context, cause error) (monitor.LeaseRecov
 	}
 	if lastErr != nil {
 		a.emitLog("自动重新登录失败：" + lastErr.Error())
+	}
+	if reason == auth.LeaseReasonMigrate {
+		// 换服后的重登也可能因为目标服务器容量、面板或资源分配失败。
+		// 优先保留重登阶段的具体业务错误，避免把可重试故障误报成换服完成。
+		if statusErr := asStatusError(lastErr); statusErr != nil && strings.TrimSpace(statusErr.Message) != "" {
+			a.emitDiagnosis(statusErr.Message)
+		} else {
+			a.emitDiagnosis("服务器已更换，请重新登录获取最新连接信息")
+		}
+		return monitor.LeaseRecovery{}, false
 	}
 	if a.lease.noteEpisodeFailed() {
 		a.emitDiagnosis("自动重新登录多次失败，请手动重新登录")

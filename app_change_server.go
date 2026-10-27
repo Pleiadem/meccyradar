@@ -28,6 +28,12 @@ func (a *App) tunnelActive() bool {
 
 // ChangeServer 换到另一台服务器，成功后自动重连。
 func (a *App) ChangeServer() (AuthResultDTO, error) {
+	if a.versionBlocked() {
+		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
+	}
+	a.changeMu.Lock()
+	defer a.changeMu.Unlock()
+
 	a.mu.Lock()
 	client, data, cardKey := a.deps.client, a.authData, a.cardKey
 	a.mu.Unlock()
@@ -45,11 +51,44 @@ func (a *App) ChangeServer() (AuthResultDTO, error) {
 		return AuthResultDTO{}, errors.New("无法停止当前隧道，请稍后重试")
 	}
 
+	a.versionUseMu.RLock()
+	if a.versionBlocked() {
+		a.versionUseMu.RUnlock()
+		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
+	}
 	refreshed, err := client.ChangeServer(context.Background(), cardKey, data.Session.LeaseID)
+	changeAttempted := true
+	// 只有服务端明确确认旧租约超时或因迁移失效，才自动登录并重试一次。
+	// 不凭本地 TTL 猜测，避免被其他设备顶掉时自动把对方再顶下线。
+	var statusErr *auth.StatusError
+	if errors.As(err, &statusErr) && statusErr.Status == 401 &&
+		(statusErr.Reason == auth.LeaseReasonTTL || statusErr.Reason == auth.LeaseReasonMigrate) {
+		a.emitLog("登录状态已超时，正在恢复后更换服务器")
+		var renewed auth.AuthData
+		changeAttempted = false
+		renewed, err = client.Login(context.Background(), cardKey)
+		if err == nil {
+			a.adoptRefreshedAuth(renewed, data)
+			a.emitSessionRestored()
+			data = &renewed
+			changeAttempted = true
+			refreshed, err = client.ChangeServer(context.Background(), cardKey, data.Session.LeaseID)
+		}
+	}
+	a.versionUseMu.RUnlock()
+	if a.versionBlocked() {
+		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
+	}
 	if err != nil {
-		// 保留原配置。原来在跑就重新连回去，别让用户白断一次。
+		// 请求结果未知时，先用一次普通登录向服务端核对当前权威配置。
+		// 这覆盖“服务端已提交但 HTTP 响应丢失”的窗口，避免盲目重启旧 token。
 		if wasRunning {
-			if restartErr := a.startTunnel(); restartErr != nil {
+			if changeAttempted {
+				if reconciled, reconcileErr := a.reconcileChangeFailure(client, cardKey, data, err); reconcileErr == nil {
+					return reconciled, nil
+				}
+			}
+			if restartErr := a.startTunnelWithoutLeaseRefresh(); restartErr != nil {
 				a.emitLog("换服失败，且恢复原连接也失败：" + restartErr.Error())
 			}
 		}
@@ -69,6 +108,7 @@ func (a *App) ChangeServer() (AuthResultDTO, error) {
 			ExpireAtStr:  refreshed.ExpireAtStr,
 			ExpireAtUnix: refreshed.ExpireAtUnix,
 			TunnelStatus: "error",
+			Warning:      refreshed.Warning,
 		}, err
 	}
 
@@ -77,6 +117,37 @@ func (a *App) ChangeServer() (AuthResultDTO, error) {
 		ExpireAtStr:  refreshed.ExpireAtStr,
 		ExpireAtUnix: refreshed.ExpireAtUnix,
 		TunnelStatus: "connecting",
+		Warning:      refreshed.Warning,
+	}, nil
+}
+
+func (a *App) reconcileChangeFailure(client *auth.Client, cardKey string, previous *auth.AuthData, cause error) (AuthResultDTO, error) {
+	// 只有传输层错误代表“请求结果未知”；业务 4xx/5xx 已经是服务端明确答复，
+	// 不要再额外登录改变服务端状态。
+	var transportErr *auth.TransportError
+	if !errors.As(cause, &transportErr) {
+		return AuthResultDTO{}, errors.New("换服结果已明确失败")
+	}
+	a.versionUseMu.RLock()
+	if a.versionBlocked() {
+		a.versionUseMu.RUnlock()
+		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
+	}
+	refreshed, err := client.Login(context.Background(), cardKey)
+	a.versionUseMu.RUnlock()
+	if a.versionBlocked() {
+		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
+	}
+	if err != nil {
+		return AuthResultDTO{}, err
+	}
+	a.adoptRefreshedAuth(refreshed, previous)
+	if err := a.startTunnelWithoutLeaseRefresh(); err != nil {
+		return AuthResultDTO{}, err
+	}
+	return AuthResultDTO{
+		AppName: refreshed.AppName, ExpireAtStr: refreshed.ExpireAtStr,
+		ExpireAtUnix: refreshed.ExpireAtUnix, TunnelStatus: "connecting", Warning: refreshed.Warning,
 	}, nil
 }
 

@@ -1,8 +1,10 @@
-.PHONY: test lint build smoke
+.PHONY: test lint build build-windows build-macos smoke
 
 ROOT := $(CURDIR)
 FRONTEND := $(ROOT)/frontend
 WAILS ?= $(shell command -v wails 2>/dev/null || printf '%s' /Users/qiuqiu/go/bin/wails)
+RELEASE_VERSION ?=
+VERSION_LDFLAG = $(if $(RELEASE_VERSION),-X meccyradar/internal/buildinfo.Version=$(RELEASE_VERSION),)
 
 test:
 	go test ./...
@@ -11,9 +13,18 @@ lint:
 	go vet ./...
 	cd $(FRONTEND) && npx tsc --noEmit
 
-build:
+# 默认构建 Windows amd64，便于在 Windows 真机验证。
+build: build-windows
+
+build-windows:
 	cd $(FRONTEND) && npm run build
-	$(WAILS) build -clean
+	$(WAILS) build -platform windows/amd64 -clean -s -trimpath -ldflags='-H windowsgui -s -w $(VERSION_LDFLAG)' -o meccyradar.exe
+	cp build/bin/meccyradar.exe build/meccyradar.exe
+
+# macOS 本机构建保留为显式目标。
+build-macos:
+	cd $(FRONTEND) && npm run build
+	$(WAILS) build -clean -ldflags='$(VERSION_LDFLAG)'
 
 smoke:
 	@set -e; \

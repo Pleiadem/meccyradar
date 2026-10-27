@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -55,6 +56,63 @@ func TestLoginHeartbeatLogoutAndConflict(t *testing.T) {
 	var conflictErr *ConflictError
 	if !errors.As(err, &conflictErr) {
 		t.Fatalf("expected conflict, got %v", err)
+	}
+}
+
+func TestLoginUsesLongBoundedTimeoutWithoutAutomaticRetry(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		time.Sleep(60 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "ok", "data": validAuthData()})
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, &http.Client{Timeout: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.authTimeout = 250 * time.Millisecond // controlled short analogue of the production 90s bound
+	if _, err := client.Login(context.Background(), "CARD-1"); err != nil {
+		t.Fatalf("login should survive the base client's short timeout: %v", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("login must not be retried; got %d requests", requests.Load())
+	}
+
+	client.authTimeout = 20 * time.Millisecond
+	if _, err := client.Login(context.Background(), "CARD-1"); err == nil {
+		t.Fatal("auth request timeout must remain bounded")
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("timeout must not trigger a login retry; got %d requests", requests.Load())
+	}
+}
+
+func TestChangeServerPreservesCleanupWarning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"code": 200,
+			"msg":  "ok",
+			"data": map[string]any{
+				"appName": "MeccyRadar", "shareBaseUrl": "http://radar.example/", "expireAtUnix": 1794736800, "expireAtStr": "2026-11-15 18:00",
+				"session": validAuthData()["session"], "frpConfig": validAuthData()["frpConfig"],
+				"warning": "旧服务器上的用户未能删除，已记录待处理",
+			},
+		})
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := client.ChangeServer(context.Background(), "CARD-1", "lease-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Warning == "" {
+		t.Fatal("换服响应中的清理 warning 不应被丢弃")
 	}
 }
 

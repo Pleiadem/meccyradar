@@ -14,14 +14,42 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 var ErrCardAlreadyOnline = errors.New("该卡密已在线")
 var ErrInvalidResponse = errors.New("服务端返回的数据无法解析")
 
 type Client struct {
-	baseURL string
-	http    *http.Client
+	baseURL     string
+	http        *http.Client
+	authTimeout time.Duration
+}
+
+type VersionInfo struct {
+	Configured  bool   `json:"configured"`
+	Version     string `json:"version"`
+	DownloadURL string `json:"downloadUrl"`
+	Notes       string `json:"notes"`
+	Force       bool   `json:"force"`
+}
+
+func (v *VersionInfo) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Configured  *bool  `json:"configured"`
+		Version     string `json:"version"`
+		DownloadURL string `json:"downloadUrl"`
+		Notes       string `json:"notes"`
+		Force       bool   `json:"force"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return ErrInvalidResponse
+	}
+	if wire.Configured == nil {
+		return ErrInvalidResponse
+	}
+	*v = VersionInfo{Configured: *wire.Configured, Version: wire.Version, DownloadURL: wire.DownloadURL, Notes: wire.Notes, Force: wire.Force}
+	return nil
 }
 
 type Session struct {
@@ -56,6 +84,7 @@ type AuthData struct {
 	ExpireAtStr  string    `json:"expireAtStr"`
 	Session      Session   `json:"session"`
 	FRPConfig    FRPConfig `json:"frpConfig"`
+	Warning      string    `json:"warning,omitempty"`
 }
 
 type envelope struct {
@@ -157,7 +186,24 @@ func NewClient(rawBaseURL string, httpClient *http.Client) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &Client{baseURL: base.String(), http: httpClient}, nil
+	return &Client{baseURL: base.String(), http: httpClient, authTimeout: 90 * time.Second}, nil
+}
+
+func (c *Client) MeccyRadarVersion(ctx context.Context) (VersionInfo, error) {
+	var out VersionInfo
+	if err := c.doJSONRequireData(ctx, http.MethodGet, "/api/client/meccyradar/version", nil, &out); err != nil {
+		return VersionInfo{}, err
+	}
+	if !out.Configured {
+		if out.Version != "" || out.DownloadURL != "" || out.Notes != "" || out.Force {
+			return VersionInfo{}, ErrInvalidResponse
+		}
+		return out, nil
+	}
+	if !validStableVersion(out.Version) || !ValidDownloadURL(out.DownloadURL) || utf8.RuneCountInString(out.Notes) > 10000 {
+		return VersionInfo{}, ErrInvalidResponse
+	}
+	return out, nil
 }
 
 func (c *Client) Login(ctx context.Context, cardKey string) (AuthData, error) {
@@ -165,7 +211,7 @@ func (c *Client) Login(ctx context.Context, cardKey string) (AuthData, error) {
 		return AuthData{}, errors.New("请输入卡密")
 	}
 	var out AuthData
-	if err := c.doJSON(ctx, http.MethodPost, "/api/client/login", loginRequest{CardKey: cardKey}, &out); err != nil {
+	if err := c.doJSONWithTimeout(ctx, http.MethodPost, "/api/client/login", loginRequest{CardKey: cardKey}, &out, c.authTimeout); err != nil {
 		return AuthData{}, err
 	}
 	if err := validateAuthData(out); err != nil {
@@ -214,8 +260,8 @@ func ParseExpiresAt(value string) int64 {
 
 // ChangeServer 换到另一台服务器，保留原到期时间。
 //
-// 服务端返回的 envelope 与 /api/client/login 完全一致，所以这里直接复用
-// AuthData 解析，不需要第二套结构。换服会签发**新租约**，旧租约随即失效。
+// 服务端返回的 envelope 与 /api/client/login 基本一致，换服成功但旧资源
+// 清理失败时会额外携带 warning。换服会签发**新租约**，旧租约随即失效。
 func (c *Client) ChangeServer(ctx context.Context, cardKey, leaseID string) (AuthData, error) {
 	if strings.TrimSpace(cardKey) == "" {
 		return AuthData{}, errors.New("请输入卡密")
@@ -225,7 +271,7 @@ func (c *Client) ChangeServer(ctx context.Context, cardKey, leaseID string) (Aut
 	}
 	var out AuthData
 	body := changeServerRequest{CardKey: cardKey, LeaseID: leaseID}
-	if err := c.doJSON(ctx, http.MethodPost, "/api/client/change-server", body, &out); err != nil {
+	if err := c.doJSONWithTimeout(ctx, http.MethodPost, "/api/client/change-server", body, &out, c.authTimeout); err != nil {
 		return AuthData{}, err
 	}
 	if err := validateAuthData(out); err != nil {
@@ -242,6 +288,24 @@ func (c *Client) Logout(ctx context.Context, leaseID string) error {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
+	return c.doJSONMode(ctx, method, path, requestBody, responseBody, false)
+}
+
+func (c *Client) doJSONRequireData(ctx context.Context, method, path string, requestBody any, responseBody any) error {
+	return c.doJSONMode(ctx, method, path, requestBody, responseBody, true)
+}
+
+func (c *Client) doJSONWithTimeout(ctx context.Context, method, path string, requestBody any, responseBody any, timeout time.Duration) error {
+	client := *c.http
+	client.Timeout = timeout
+	return c.doJSONModeWithClient(ctx, method, path, requestBody, responseBody, false, &client)
+}
+
+func (c *Client) doJSONMode(ctx context.Context, method, path string, requestBody any, responseBody any, requireData bool) error {
+	return c.doJSONModeWithClient(ctx, method, path, requestBody, responseBody, requireData, c.http)
+}
+
+func (c *Client) doJSONModeWithClient(ctx context.Context, method, path string, requestBody any, responseBody any, requireData bool, client *http.Client) error {
 	body, err := json.Marshal(requestBody)
 	if err != nil {
 		return err
@@ -253,7 +317,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 		return errors.New("服务端地址无效，请检查配置")
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return c.redactTransportError(err)
 	}
@@ -276,7 +340,13 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 	if envelope.Code != 200 {
 		return applicationError(envelope.Code, envelope.Msg)
 	}
-	if responseBody == nil || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+	if responseBody == nil {
+		return nil
+	}
+	if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		if requireData {
+			return ErrInvalidResponse
+		}
 		return nil
 	}
 	if err := json.Unmarshal(envelope.Data, responseBody); err != nil {

@@ -11,6 +11,7 @@ export type TunnelButtonState = {
 }
 
 export function remainingSeconds(state: TunnelButtonState): number
+export function remainingTimeLabel(state: TunnelButtonState): string
 export function isExpired(state: TunnelButtonState): boolean
 export function canToggleTunnel(state: TunnelButtonState): boolean
 export function tunnelButtonLabel(state: TunnelButtonState): string

@@ -39,6 +39,18 @@ type rule struct {
 // 更具体的规则必须排在前面。
 var rules = []rule{
 	{
+		keywords: []string{"服务器已更换，请重新登录获取最新连接信息"},
+		level:    LevelWarning,
+		title:    "服务器已更换",
+		hint:     "服务器已更换，请重新登录获取最新连接信息",
+	},
+	{
+		keywords: []string{"服务资源分配失败", "资源分配失败", "暂无可用服务器", "暂无其他可用服务器"},
+		level:    LevelWarning,
+		title:    "服务器资源暂时不可用",
+		hint:     "请稍后重试；如果问题持续，请联系管理员检查服务器容量和面板状态",
+	},
+	{
 		// 端口占用：FRPC 绑定远端端口失败。
 		keywords: []string{
 			"port already in use",
