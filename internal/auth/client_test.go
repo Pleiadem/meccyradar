@@ -59,6 +59,35 @@ func TestLoginHeartbeatLogoutAndConflict(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeLinkAttemptUsesLeaseBoundVersionCAS(t *testing.T) {
+	var gotLease string
+	var gotVersion int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/client/link-ack" || r.Method != http.MethodPost {
+			t.Errorf("unexpected ack request: %s %s", r.Method, r.URL.Path)
+		}
+		var request linkAckRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode ack request: %v", err)
+		}
+		gotLease, gotVersion = request.LeaseID, request.LinkVersion
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "ok", "data": map[string]any{"accepted": true}})
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := client.AcknowledgeLinkAttempt(context.Background(), "lease-current", 7)
+	if err != nil || !accepted {
+		t.Fatalf("ack attempt: accepted=%v err=%v", accepted, err)
+	}
+	if gotLease != "lease-current" || gotVersion != 7 {
+		t.Fatalf("ack binding mismatch: lease=%q version=%d", gotLease, gotVersion)
+	}
+}
+
 func TestLoginUsesLongBoundedTimeoutWithoutAutomaticRetry(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

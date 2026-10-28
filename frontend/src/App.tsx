@@ -6,6 +6,8 @@ import './index.css'
 import { isVersionSkipped, shouldOfferVersion, skipVersion } from './version_update.js'
 import { createVersionCheckRunner, versionCheckButtonState } from './version_check.js'
 import { alreadyAuthenticatedMessage, confirmSameActiveSessionConflict } from './session_conflict.js'
+import { applyLinkAckEvent } from './link_ack_event.js'
+import { sessionInvalidatedState } from './session_state.js'
 
 type VersionInfo = { configured: boolean; version: string; downloadUrl: string; notes: string; force: boolean }
 type VersionSnapshot = { info: VersionInfo; currentVersion: string; requiredVersion: string; downloadUrl: string; blocked: boolean; checking: boolean; checkError: string }
@@ -17,6 +19,9 @@ type InitState = {
   expireAtUnix?: number
   expiresIn?: number
   tunnelStatus: string
+  leaseId?: string
+  linkVersion?: number
+  copyPending?: boolean
 }
 
 type AuthResult = {
@@ -25,11 +30,16 @@ type AuthResult = {
   expireAtUnix: number
   tunnelStatus: string
   warning?: string
+  leaseId?: string
+  linkVersion?: number
+  copyPending?: boolean
 }
 
+type ShareLinkAttempt = { attempted: boolean; copied: boolean; link?: string; error?: string }
 type TunnelStatus = { status: string; pingMs?: number; expiresIn?: number; message?: string; timeout?: boolean; done?: boolean }
 type PortStatus = { open: boolean }
 type LogEvent = { message: string; at: string }
+type LinkAckEvent = { accepted: boolean; leaseId: string; linkVersion: number }
 // 后端算好的失败诊断：标题 + 解决建议（认不出类型时只有原始错误）
 type Diagnosis = { level: 'warning' | 'error'; title: string; hint?: string; raw?: string }
 
@@ -39,6 +49,7 @@ type Backend = {
   StartTunnel?: () => Promise<void>
   StopTunnel?: () => Promise<void>
   CopyShareLink?: (password: string) => Promise<void>
+  CopyLinkForDelivery?: (password: string, version: number) => Promise<ShareLinkAttempt>
   RadarPassword?: () => Promise<string>
   SaveRadarPassword?: (password: string) => Promise<void>
   RemeasurePing?: () => Promise<void>
@@ -73,6 +84,9 @@ const versionStorage = {
 
 export default function App() {
   const [init, setInit] = useState<InitState>({ authenticated: false, tunnelStatus: 'idle' })
+  const initRef = useRef(init)
+  initRef.current = init
+  const lastLinkAckRef = useRef<LinkAckEvent | null>(null)
   const [hydrated, setHydrated] = useState(false)
   const [versionInfo, setVersionInfo] = useState<VersionInfo>()
   const [versionBlocked, setVersionBlocked] = useState(false)
@@ -91,6 +105,8 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
+  const [linkPrompt, setLinkPrompt] = useState<{ version: number } | null>(null)
+  const [copyFailure, setCopyFailure] = useState<{ link: string; message: string } | null>(null)
   const [pingMs, setPingMs] = useState<number>()
   const [measuring, setMeasuring] = useState(false)
   const measureTimer = useRef<number | undefined>(undefined)
@@ -109,6 +125,31 @@ export default function App() {
   const logBox = useRef<HTMLDivElement>(null)
   const versionRequest = useRef(false)
   const versionRunner = useRef<ReturnType<typeof createVersionCheckRunner> | undefined>(undefined)
+
+  const refreshAuthoritativeInit = async () => {
+    if (!backend?.GetInitState) return
+    try {
+      const state = await backend.GetInitState()
+      if (!state) return
+      const current = publishInitState(state)
+      if (!current.authenticated) {
+        setLinkPrompt(null)
+        setCopyFailure(null)
+      }
+    } catch {
+      // Keep the original action error visible when authoritative refresh fails.
+    }
+  }
+
+  const publishInitState = (state: InitState): InitState => {
+    const ack = lastLinkAckRef.current
+    const matchesAck = Boolean(ack?.accepted && state.authenticated && state.leaseId === ack.leaseId && state.linkVersion === ack.linkVersion)
+    const next = ack ? applyLinkAckEvent(state, ack) : state
+    initRef.current = next
+    setInit(next)
+    if (matchesAck && ack) setLinkPrompt((prompt) => prompt?.version === ack.linkVersion ? null : prompt)
+    return next
+  }
 
   const applyVersionSnapshot = (snapshot: VersionSnapshot, manual: boolean) => {
     setCurrentVersion(snapshot.currentVersion)
@@ -162,7 +203,10 @@ export default function App() {
     void refreshVersionCheck(false)
     if (backend?.GetInitState) {
       void backend.GetInitState().then((state) => {
-        if (state) setInit(state)
+        if (state) {
+          const current = publishInitState(state)
+          if (current.authenticated && current.copyPending && current.linkVersion) setLinkPrompt({ version: current.linkVersion })
+        }
         setHydrated(true)
         // 没进主界面说明自动登录没成（或还没跑完），把上次的卡密填好，
         // 用户只需点一下登录，不用重新手打。
@@ -197,11 +241,32 @@ export default function App() {
       const event = data[0] as PortStatus | undefined
       if (event) setPortOpen(event.open)
     })
+    const offSessionInvalidated = runtime?.EventsOn?.('session:invalidated', () => {
+      publishInitState(sessionInvalidatedState())
+      setLinkPrompt(null)
+      setCopyFailure(null)
+    })
+    const offLinkAck = runtime?.EventsOn?.('link:acknowledged', (...data) => {
+      const event = data[0] as LinkAckEvent | undefined
+      if (!event) return
+      lastLinkAckRef.current = event
+      const current = initRef.current
+      const matchesAck = current.authenticated && current.leaseId === event.leaseId && current.linkVersion === event.linkVersion
+      const next = applyLinkAckEvent(current, event)
+      if (next !== current) {
+        initRef.current = next
+        setInit(next)
+      }
+      if (matchesAck) setLinkPrompt((prompt) => prompt?.version === event.linkVersion ? null : prompt)
+    })
     // 自动登录是在后端后台完成的，前端挂载时可能还没结束。
     // 没有这个事件的话，自动登录成功后界面仍然停在登录页。
     const offRestored = runtime?.EventsOn?.('session:restored', (...data) => {
       const state = data[0] as InitState | undefined
-      if (state) setInit(state)
+      if (state) {
+        const current = publishInitState(state)
+        if (current.copyPending && current.linkVersion) setLinkPrompt({ version: current.linkVersion })
+      }
       // 自动登录成功后把记住的雷达密码也填回去，否则界面是空的、
       // 复制出来的链接会缺 k=。
       if (backend?.RadarPassword) {
@@ -221,6 +286,8 @@ export default function App() {
       offVersion?.()
       offStatus?.()
       offPort?.()
+      offLinkAck?.()
+      offSessionInvalidated?.()
       offRestored?.()
       offDiagnosis?.()
       offLog?.()
@@ -260,7 +327,9 @@ export default function App() {
     setBusy(true); setError('')
     try {
       const result = await backend.LoginByCard(cardKey.trim())
-      setInit({ authenticated: true, appName: result.appName, expireAtStr: result.expireAtStr, expireAtUnix: result.expireAtUnix, tunnelStatus: result.tunnelStatus })
+      const current = publishInitState({ authenticated: true, appName: result.appName, expireAtStr: result.expireAtStr, expireAtUnix: result.expireAtUnix, tunnelStatus: result.tunnelStatus, leaseId: result.leaseId, linkVersion: result.linkVersion, copyPending: result.copyPending })
+      setCopyFailure(null)
+      if (current.copyPending && current.linkVersion) setLinkPrompt({ version: current.linkVersion })
     } catch (cause) {
       const message = toMessage(cause)
       // An automatic restore may finish immediately before this manual call.
@@ -269,7 +338,8 @@ export default function App() {
       if (message === alreadyAuthenticatedMessage && backend?.GetInitState && backend?.SavedCardKey) {
         const state = await confirmSameActiveSessionConflict(message, cardKey, backend.GetInitState, backend.SavedCardKey)
         if (state) {
-          setInit(state)
+          const current = publishInitState(state)
+          if (current.copyPending && current.linkVersion) setLinkPrompt({ version: current.linkVersion })
           setError('')
           return
         }
@@ -289,7 +359,11 @@ export default function App() {
         await backend?.StartTunnel?.()
         setInit((current) => ({ ...current, tunnelStatus: 'connecting' }))
       }
-    } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
+    } catch (cause) {
+      const message = toMessage(cause)
+      await refreshAuthoritativeInit()
+      setError(message)
+    } finally { setBusy(false) }
   }
 
   const stopMeasuring = () => {
@@ -326,14 +400,31 @@ export default function App() {
     }
   }
 
+  const performCopyAttempt = async (version: number): Promise<ShareLinkAttempt> => {
+    if (!backend?.CopyLinkForDelivery) throw new Error('链接复制服务不可用，请重启客户端')
+    return backend.CopyLinkForDelivery(radarPassword, version)
+  }
+
   const copyLink = async () => {
+    const promptedVersion = linkPrompt?.version
+    if (promptedVersion) setLinkPrompt(null)
     setBusy(true); setError(''); setCopied(false)
-    try { await backend?.CopyShareLink?.(radarPassword); setCopied(true) } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
+    try {
+      const version = promptedVersion ?? init.linkVersion
+      if (version && backend?.CopyLinkForDelivery) {
+        const result = await performCopyAttempt(version)
+        if (result.attempted && result.copied) { setCopied(true); setCopyFailure(null) }
+        else if (result.attempted && result.link) setCopyFailure({ link: result.link, message: result.error || '剪贴板写入失败；你可以手动选择下方链接复制' })
+      } else {
+        await backend?.CopyShareLink?.(radarPassword)
+        setCopied(true)
+      }
+    } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
   }
 
   const logout = async () => {
     setBusy(true)
-    try { await backend?.Logout?.(); setInit({ authenticated: false, tunnelStatus: 'idle' }); setError('') } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
+    try { await backend?.Logout?.(); publishInitState({ authenticated: false, tunnelStatus: 'idle' }); setLinkPrompt(null); setError('') } catch (cause) { setError(toMessage(cause)) } finally { setBusy(false) }
   }
 
   const openSettings = async () => {
@@ -374,12 +465,17 @@ export default function App() {
     try {
       const result = await backend?.ChangeServer?.()
       if (!result) throw new Error('换服服务不可用，请稍后重试')
-      setInit((current) => ({ ...current, ...result, authenticated: true }))
+      const next = publishInitState({ ...init, ...result, authenticated: true })
       setCopied(false)
       setSettingsWarning(Boolean(result.warning))
-      setSettingsNotice(result.warning ? `${changeServerSuccessNotice}；${result.warning}` : changeServerSuccessNotice)
+      setSettingsNotice('')
+      setCopyFailure(null)
+      if (next.copyPending && next.linkVersion) setLinkPrompt({ version: next.linkVersion })
     } catch (cause) {
-      setSettingsError(toMessage(cause))
+      const message = toMessage(cause)
+      await refreshAuthoritativeInit()
+      setError(message)
+      setSettingsError(message)
     } finally { setChangingServer(false) }
   }
 
@@ -428,7 +524,10 @@ export default function App() {
     ) : undefined}
   >
     {init.authenticated ? (
-      <ConsoleView init={init} pingMs={pingMs} measuring={measuring} onRemeasure={remeasure} diagnosis={diagnosis} portOpen={portOpen} logs={logs} logBox={logBox} radarPassword={radarPassword} showRadarPassword={showRadarPassword} busy={busy} copied={copied} error={error} onPasswordChange={(value) => { setRadarPassword(value); void backend?.SaveRadarPassword?.(value) }} onTogglePassword={() => setShowRadarPassword(!showRadarPassword)} onToggleTunnel={toggleTunnel} onCopy={copyLink} onLogout={logout} />
+      <>
+        <ConsoleView init={init} linkNotice={Boolean(linkPrompt && linkPrompt.version === init.linkVersion)} pingMs={pingMs} measuring={measuring} onRemeasure={remeasure} diagnosis={diagnosis} portOpen={portOpen} logs={logs} logBox={logBox} radarPassword={radarPassword} showRadarPassword={showRadarPassword} busy={busy} copied={copied} error={error} onPasswordChange={(value) => { setRadarPassword(value); void backend?.SaveRadarPassword?.(value) }} onTogglePassword={() => setShowRadarPassword(!showRadarPassword)} onToggleTunnel={toggleTunnel} onCopy={copyLink} onLogout={logout} />
+        {copyFailure && <ShareLinkCopyFailure link={copyFailure.link} message={copyFailure.message} onDismiss={() => setCopyFailure(null)} />}
+      </>
     ) : (
       <LoginView cardKey={cardKey} showCardKey={showCardKey} busy={busy} error={error} onCardKeyChange={setCardKey} onToggleCardKey={() => setShowCardKey(!showCardKey)} onSubmit={handleLogin} />
     )}
@@ -451,13 +550,13 @@ function WindowShell({ authenticated, onOpenSettings, overlay, children }: { aut
 }
 
 function LoginView({ cardKey, showCardKey, busy, error, onCardKeyChange, onToggleCardKey, onSubmit }: { cardKey: string; showCardKey: boolean; busy: boolean; error: string; onCardKeyChange: (value: string) => void; onToggleCardKey: () => void; onSubmit: (event: FormEvent) => void }) {
-  return <main className="glass-bg grid h-full min-h-0 w-full grid-cols-1 overflow-hidden p-3 pt-12 pb-12 text-white selection:bg-white/30 transition-colors duration-300 sm:p-4 sm:pt-12 sm:pb-12 min-[700px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] min-[700px]:gap-6 min-[700px]:px-8">
+  return <main className="glass-bg grid h-full min-h-0 w-full grid-cols-1 overflow-hidden px-3 pt-12 pb-12 text-white selection:bg-white/30 transition-colors duration-300 min-[700px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] min-[700px]:gap-6 min-[700px]:px-8">
     <section className="glass-panel relative hidden h-full min-h-0 min-w-0 flex-col justify-center overflow-hidden px-7 min-[700px]:flex"><div aria-hidden="true" className="absolute inset-0 bg-[radial-gradient(ellipse_at_28%_35%,rgba(72,98,117,0.38),transparent_52%),linear-gradient(145deg,#1c2228_0%,#090a0b_70%)]" /><motion.div initial="hidden" animate="visible" variants={{ hidden: {}, visible: { transition: { staggerChildren: 0.12, delayChildren: 0.08 } } }} className="relative z-10 w-full max-w-xs space-y-7"><motion.div variants={reveal} className="flex items-center gap-3 text-lg font-semibold tracking-tight"><span className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/[0.06]"><Radar size={20} strokeWidth={1.7} /></span><span>MeccyRadar</span></motion.div><motion.div variants={reveal} className="space-y-3"><h1 className="text-3xl font-medium tracking-tight">欢迎回来</h1><p className="text-sm leading-relaxed text-white/70">输入卡密，连接你的专属雷达。</p></motion.div><motion.div variants={reveal} className="flex items-center gap-3 border-t border-white/10 pt-5 text-xs text-white/60"><span className="h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_12px_rgba(110,231,183,0.35)]" />安全授权，稳定连接</motion.div></motion.div></section>
-    <section className="flex min-h-0 min-w-0 flex-col items-center justify-center px-4 py-3 sm:px-8 min-[700px]:items-end min-[700px]:px-0"><motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, ease: 'easeOut' }} className="glass-panel w-full max-w-sm space-y-6 p-6"><header className="space-y-2"><p className="text-[11px] font-medium tracking-[0.18em] text-white/55">MECCY RADAR</p><h2 className="text-2xl font-medium tracking-tight">卡密登录</h2><p className="text-[13px] text-white/65">授权后管理隧道连接和雷达分享。</p></header><form className="space-y-4" onSubmit={onSubmit}><label className="block text-[13px] font-medium text-white/90">卡密<span className="relative mt-2 block"><input required value={cardKey} onChange={(event) => onCardKeyChange(event.target.value)} type={showCardKey ? 'text' : 'password'} className="glass-field h-11 w-full px-4 pr-12 text-sm text-white outline-none transition-colors placeholder:text-white/45 hover:border-white/25 focus:border-white/40 focus:ring-2 focus:ring-white/15" placeholder="请输入卡密" /><button type="button" aria-label={showCardKey ? '隐藏卡密' : '显示卡密'} onClick={onToggleCardKey} className="absolute right-1 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-lg text-white/65 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40">{showCardKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></span></label>{error && <motion.p initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} role="alert" className="rounded-xl border border-rose-400/25 bg-rose-400/10 px-4 py-3 text-xs text-rose-200">{error}</motion.p>}<button disabled={busy} type="submit" className="group flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-white text-sm font-semibold text-black shadow-[0_8px_24px_rgba(255,255,255,0.07)] transition duration-200 hover:-translate-y-0.5 hover:bg-white/90 active:translate-y-0 active:scale-[0.99] disabled:cursor-wait disabled:opacity-60">{busy ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-black/25 border-t-black" />登录中…</> : '登录并连接'}</button></form><p className="text-[11px] leading-relaxed text-white/50">卡密用于识别授权状态，请勿分享给他人。</p></motion.div></section>
+    <section className="flex min-h-0 min-w-0 flex-col items-center justify-center px-4 py-3 min-[700px]:items-end min-[700px]:px-0"><motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, ease: 'easeOut' }} className="glass-panel w-full max-w-sm space-y-6 p-6"><header className="space-y-2"><p className="text-[11px] font-medium tracking-[0.18em] text-white/55">MECCY RADAR</p><h2 className="text-2xl font-medium tracking-tight">卡密登录</h2><p className="text-[13px] text-white/65">授权后管理隧道连接和雷达分享。</p></header><form className="space-y-4" onSubmit={onSubmit}><label className="block text-[13px] font-medium text-white/90">卡密<span className="relative mt-2 block"><input required value={cardKey} onChange={(event) => onCardKeyChange(event.target.value)} type={showCardKey ? 'text' : 'password'} className="glass-field h-11 w-full px-4 pr-12 text-sm text-white outline-none transition-colors placeholder:text-white/45 hover:border-white/25 focus:border-white/40 focus:ring-2 focus:ring-white/15" placeholder="请输入卡密" /><button type="button" aria-label={showCardKey ? '隐藏卡密' : '显示卡密'} onClick={onToggleCardKey} className="absolute right-1 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-lg text-white/65 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40">{showCardKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></span></label>{error && <motion.p initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} role="alert" className="rounded-xl border border-rose-400/25 bg-rose-400/10 px-4 py-3 text-xs text-rose-200">{error}</motion.p>}<button disabled={busy} type="submit" className="group flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-white text-sm font-semibold text-black shadow-[0_8px_24px_rgba(255,255,255,0.07)] transition duration-200 hover:-translate-y-0.5 hover:bg-white/90 active:translate-y-0 active:scale-[0.99] disabled:cursor-wait disabled:opacity-60">{busy ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-black/25 border-t-black" />登录中…</> : '登录并连接'}</button></form><p className="text-[11px] leading-relaxed text-white/50">卡密用于识别授权状态，请勿分享给他人。</p></motion.div></section>
   </main>
 }
 
-function ConsoleView({ init, pingMs, measuring, onRemeasure, diagnosis, portOpen, logs, logBox, radarPassword, showRadarPassword, busy, copied, error, onPasswordChange, onTogglePassword, onToggleTunnel, onCopy }: { init: InitState; pingMs?: number; measuring: boolean; onRemeasure: () => void; diagnosis?: Diagnosis; portOpen: boolean; logs: LogEvent[]; logBox: RefObject<HTMLDivElement | null>; radarPassword: string; showRadarPassword: boolean; busy: boolean; copied: boolean; error: string; onPasswordChange: (value: string) => void; onTogglePassword: () => void; onToggleTunnel: () => void; onCopy: () => void; onLogout: () => void }) {
+function ConsoleView({ init, linkNotice, pingMs, measuring, onRemeasure, diagnosis, portOpen, logs, logBox, radarPassword, showRadarPassword, busy, copied, error, onPasswordChange, onTogglePassword, onToggleTunnel, onCopy }: { init: InitState; linkNotice: boolean; pingMs?: number; measuring: boolean; onRemeasure: () => void; diagnosis?: Diagnosis; portOpen: boolean; logs: LogEvent[]; logBox: RefObject<HTMLDivElement | null>; radarPassword: string; showRadarPassword: boolean; busy: boolean; copied: boolean; error: string; onPasswordChange: (value: string) => void; onTogglePassword: () => void; onToggleTunnel: () => void; onCopy: () => void; onLogout: () => void }) {
   const status = init.tunnelStatus
   const active = status === 'connected' || status === 'connecting'
   // 到期后不该还能点"启动隧道"：那只会让 FRPC 吐出英文登录失败。
@@ -468,12 +567,19 @@ function ConsoleView({ init, pingMs, measuring, onRemeasure, diagnosis, portOpen
   // 只做文案与文字颜色，不再有任何光晕/发光效果。
   const tunnelLabel = status === 'connected' ? '运行中' : status === 'connecting' ? '连接中' : status === 'error' ? '已断开' : '未启动'
   const tunnelColor = status === 'connected' ? 'text-emerald-200' : status === 'connecting' ? 'text-amber-200' : status === 'error' ? 'text-rose-200' : 'text-white/45'
-  return <main className="glass-bg h-full min-h-0 w-full overflow-hidden p-3 pt-12 text-white sm:p-4 sm:pt-12"><div className="grid h-full min-h-0 grid-cols-1 gap-3 min-[620px]:grid-cols-[minmax(0,0.88fr)_minmax(0,1.12fr)]"><motion.section initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.32 }} className="glass-panel flex min-h-0 flex-col justify-between p-4 sm:p-5"><div><div className="flex items-center justify-between"><p className="text-xs font-medium tracking-wide text-white/55">授权状态</p><span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${init.authenticated ? 'bg-emerald-300/10 text-emerald-200' : 'bg-white/10 text-white/50'}`}>{init.authenticated ? '已授权' : '未授权'}</span></div><p className="mt-5 text-2xl font-semibold tracking-tight sm:text-3xl">{remainingTimeLabel(init)}</p><p className="mt-2 text-xs text-white/55">到期时间：{init.expireAtStr ?? '—'}</p></div><div className="space-y-3"><button type="button" onClick={onRemeasure} disabled={measuring} title="点击重新测速" className="flex w-full items-center justify-between glass-field px-3 py-2.5 text-sm transition-colors hover:bg-white/[0.075] disabled:cursor-wait"><span className="text-white/70">节点延迟</span><span className="flex items-center gap-2 font-mono text-white/80">{measuring ? <><RefreshCw size={13} className="animate-spin" /><span className="text-white/60">测速中…</span></> : pingMs === undefined ? '点击测速' : `${pingMs} ms`}</span></button><div className="flex items-center justify-between glass-field px-3 py-2.5 text-sm"><span className="text-white/70">隧道状态</span><span className={tunnelColor}>{tunnelLabel}</span></div><div className="flex items-center justify-between glass-field px-3 py-2.5 text-sm"><span className="text-white/70">本地端口</span><span className={portOpen ? 'text-emerald-200' : 'text-white/45'}>{portOpen ? '已监听' : '未监听'}</span></div><button onClick={onToggleTunnel} disabled={busy || !canConnect} title={connectHint} className={`flex h-12 w-full items-center justify-center gap-2.5 rounded-xl font-semibold transition duration-200 active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-45 ${active ? 'bg-white text-black hover:bg-white/90' : 'border border-white/15 bg-white/[0.045] text-white hover:border-white/25 hover:bg-white/10'}`}><Power size={17} strokeWidth={1.8} />{tunnelButtonLabel(init)}</button></div></motion.section><section className="flex min-h-0 min-w-0 flex-col gap-3"><motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.36, delay: 0.05 }} className="glass-panel shrink-0 p-4"><div className="flex items-center justify-between gap-3"><label htmlFor="radar-password" className="text-sm font-medium text-white/90">雷达链接（请输入副机卡密后八位）</label></div><div className="mt-3 flex min-w-0 gap-2"><div className="relative min-w-0 flex-1"><input id="radar-password" value={radarPassword} onChange={(event) => onPasswordChange(event.target.value)} type={showRadarPassword ? 'text' : 'password'} className="glass-field h-11 w-full px-3 pr-10 text-sm text-white outline-none transition-colors placeholder:text-white/35 hover:border-white/25 focus:border-white/40 focus:ring-2 focus:ring-white/15" placeholder="输入副机卡密后八位" /><button type="button" onClick={onTogglePassword} className="absolute right-1 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-lg text-white/50 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40" aria-label={showRadarPassword ? '隐藏密码' : '显示密码'}>{showRadarPassword ? <EyeOff size={16} /> : <Eye size={16} />}</button></div><button onClick={onCopy} disabled={busy} title={radarPassword.trim().length < 8 ? '副机卡密后八位通常为 8 个字符' : undefined} className={`flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-white px-3 text-sm font-semibold text-black transition duration-200 hover:-translate-y-0.5 hover:bg-white/90 active:translate-y-0 active:scale-[0.98] disabled:cursor-wait disabled:opacity-60 ${radarPassword.trim().length < 8 ? 'opacity-[0.45]' : ''}`}><Copy size={15} />{copied ? '已复制' : '复制'}</button></div>{error && <motion.p initial={{ opacity: 0, y: -3 }} animate={{ opacity: 1, y: 0 }} role="alert" className="mt-2 rounded-lg bg-rose-400/10 px-3 py-2 text-xs text-rose-200">{error}</motion.p>}</motion.div><div className="glass-panel flex min-h-0 flex-1 flex-col overflow-hidden"><div className="flex h-10 shrink-0 items-center justify-between border-b border-white/[0.07] px-4"><span className="text-xs font-medium text-white/65">运行日志</span><span className="text-[11px] text-white/35">实时</span></div><div ref={logBox} className="min-h-0 flex-1 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-5 text-white/55" aria-live="polite">{diagnosis && <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} role="alert" className={`mb-3 rounded-xl border px-3 py-2.5 font-sans text-xs ${diagnosis.level === 'warning' ? 'border-amber-300/30 bg-amber-300/10' : 'border-rose-400/30 bg-rose-400/10'}`}><div className={`flex items-center gap-2 font-semibold ${diagnosis.level === 'warning' ? 'text-amber-200' : 'text-rose-200'}`}>{diagnosis.level === 'warning' ? <AlertTriangle size={14} strokeWidth={2} /> : <XCircle size={14} strokeWidth={2} />}{diagnosis.title}</div>{diagnosis.hint ? <p className="mt-1 leading-relaxed text-white/60">{diagnosis.hint}</p> : diagnosis.raw ? <p className="mt-1 break-words leading-relaxed text-white/60">{diagnosis.raw}</p> : null}</motion.div>}{logs.length === 0 ? <p className="text-white/35">等待隧道日志…</p> : logs.map((log, index) => <p key={`${log.at}-${index}`} className="break-words"><span className="mr-2 text-white/35">{log.at}</span>{log.message}</p>)}</div></div></section></div></main>
+  return <main className="glass-bg h-full min-h-0 w-full overflow-hidden p-3 pt-12 text-white sm:p-4 sm:pt-12"><div className="grid h-full min-h-0 grid-cols-1 gap-3 min-[620px]:grid-cols-[minmax(0,0.88fr)_minmax(0,1.12fr)]"><motion.section initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.32 }} className="glass-panel flex min-h-0 flex-col justify-between p-4 sm:p-5"><div><div className="flex items-center justify-between"><p className="text-xs font-medium tracking-wide text-white/55">授权状态</p><span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${init.authenticated ? 'bg-emerald-300/10 text-emerald-200' : 'bg-white/10 text-white/50'}`}>{init.authenticated ? '已授权' : '未授权'}</span></div><p className="mt-5 text-2xl font-semibold tracking-tight sm:text-3xl">{remainingTimeLabel(init)}</p><p className="mt-2 text-xs text-white/55">到期时间：{init.expireAtStr ?? '—'}</p></div><div className="space-y-3"><button type="button" onClick={onRemeasure} disabled={measuring} title="点击重新测速" className="flex w-full items-center justify-between glass-field px-3 py-2.5 text-sm transition-colors hover:bg-white/[0.075] disabled:cursor-wait"><span className="text-white/70">节点延迟</span><span className="flex items-center gap-2 font-mono text-white/80">{measuring ? <><RefreshCw size={13} className="animate-spin" /><span className="text-white/60">测速中…</span></> : pingMs === undefined ? '点击测速' : `${pingMs} ms`}</span></button><div className="flex items-center justify-between glass-field px-3 py-2.5 text-sm"><span className="text-white/70">隧道状态</span><span className={tunnelColor}>{tunnelLabel}</span></div><div className="flex items-center justify-between glass-field px-3 py-2.5 text-sm"><span className="text-white/70">本地端口</span><span className={portOpen ? 'text-emerald-200' : 'text-white/45'}>{portOpen ? '已监听' : '未监听'}</span></div><button onClick={onToggleTunnel} disabled={busy || !canConnect} title={connectHint} className={`flex h-12 w-full items-center justify-center gap-2.5 rounded-xl font-semibold transition duration-200 active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-45 ${active ? 'bg-white text-black hover:bg-white/90' : 'border border-white/15 bg-white/[0.045] text-white hover:border-white/25 hover:bg-white/10'}`}><Power size={17} strokeWidth={1.8} />{tunnelButtonLabel(init)}</button></div></motion.section><section className="flex min-h-0 min-w-0 flex-col gap-3"><motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.36, delay: 0.05 }} className="glass-panel shrink-0 p-4"><div className="flex items-center justify-between gap-3"><label htmlFor="radar-password" className="text-sm font-medium text-white/90">雷达链接（请输入副机卡密后八位）</label></div><div className="mt-3 flex min-w-0 gap-2"><div className="relative min-w-0 flex-1"><input id="radar-password" value={radarPassword} onChange={(event) => onPasswordChange(event.target.value)} type={showRadarPassword ? 'text' : 'password'} className="glass-field h-11 w-full px-3 pr-10 text-sm text-white outline-none transition-colors placeholder:text-white/35 hover:border-white/25 focus:border-white/40 focus:ring-2 focus:ring-white/15" placeholder="输入副机卡密后八位" /><button type="button" onClick={onTogglePassword} className="absolute right-1 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-lg text-white/50 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40" aria-label={showRadarPassword ? '隐藏密码' : '显示密码'}>{showRadarPassword ? <EyeOff size={16} /> : <Eye size={16} />}</button></div><button onClick={onCopy} disabled={busy} title={radarPassword.trim().length < 8 ? '副机卡密后八位通常为 8 个字符' : undefined} className={`flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-white px-3 text-sm font-semibold text-black transition duration-200 hover:-translate-y-0.5 hover:bg-white/90 active:translate-y-0 active:scale-[0.98] disabled:cursor-wait disabled:opacity-60 ${radarPassword.trim().length < 8 ? 'opacity-[0.45]' : ''}`}><Copy size={15} />{copied ? '已复制' : '复制'}</button></div>{linkNotice && <p role="status" className="mt-2 rounded-lg border border-emerald-300/20 bg-emerald-300/10 px-3 py-2 text-xs text-emerald-200 motion-reduce:transition-none">{changeServerSuccessNotice}</p>}{error && <motion.p initial={{ opacity: 0, y: -3 }} animate={{ opacity: 1, y: 0 }} role="alert" className="mt-2 rounded-lg bg-rose-400/10 px-3 py-2 text-xs text-rose-200">{error}</motion.p>}</motion.div><div className="glass-panel flex min-h-0 flex-1 flex-col overflow-hidden"><div className="flex h-10 shrink-0 items-center justify-between border-b border-white/[0.07] px-4"><span className="text-xs font-medium text-white/65">运行日志</span><span className="text-[11px] text-white/35">实时</span></div><div ref={logBox} className="min-h-0 flex-1 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-5 text-white/55" aria-live="polite">{diagnosis && <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} role="alert" className={`mb-3 rounded-xl border px-3 py-2.5 font-sans text-xs ${diagnosis.level === 'warning' ? 'border-amber-300/30 bg-amber-300/10' : 'border-rose-400/30 bg-rose-400/10'}`}><div className={`flex items-center gap-2 font-semibold ${diagnosis.level === 'warning' ? 'text-amber-200' : 'text-rose-200'}`}>{diagnosis.level === 'warning' ? <AlertTriangle size={14} strokeWidth={2} /> : <XCircle size={14} strokeWidth={2} />}{diagnosis.title}</div>{diagnosis.hint ? <p className="mt-1 leading-relaxed text-white/60">{diagnosis.hint}</p> : diagnosis.raw ? <p className="mt-1 break-words leading-relaxed text-white/60">{diagnosis.raw}</p> : null}</motion.div>}{logs.length === 0 ? <p className="text-white/35">等待隧道日志…</p> : logs.map((log, index) => <p key={`${log.at}-${index}`} className="break-words"><span className="mr-2 text-white/35">{log.at}</span>{log.message}</p>)}</div></div></section></div></main>
 }
 
 function VersionUpdateModal({ info, onDownload, onLater, onSkip }: { info: VersionInfo; onDownload: () => void; onLater: () => void; onSkip: () => void }) {
   const reducedMotion = useReducedMotion()
   return <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" role="presentation"><motion.section initial={reducedMotion ? false : { opacity:0, y:8 }} animate={{ opacity:1, y:0 }} transition={{ duration:reducedMotion ? 0 : 0.18 }} role="dialog" aria-modal="true" aria-label="发现新版本" className="glass-panel w-full max-w-md space-y-4 p-6"><h2 className="text-lg font-semibold">发现新版本 {info.version}</h2><p className="text-sm text-white/70">{info.notes || '此版本包含改进。下载后请手动运行新版安装程序。'}</p><p className="text-xs text-white/45">下载链接将在系统浏览器打开；请手动核对并运行下载文件。客户端不会自动下载或安装。</p><div className="flex flex-wrap justify-end gap-2"><button type="button" onClick={onLater} autoFocus className="rounded-lg border border-white/20 px-3 py-2 text-sm hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 active:scale-95 motion-reduce:transition-none">稍后</button><button type="button" onClick={onSkip} className="rounded-lg border border-white/20 px-3 py-2 text-sm hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 active:scale-95">跳过此版本</button><button type="button" onClick={onDownload} className="rounded-lg bg-white px-3 py-2 text-sm font-semibold text-slate-900 hover:bg-white/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70 active:scale-95">打开下载页</button></div></motion.section></div>
+}
+
+function ShareLinkCopyFailure({ link, message, onDismiss }: { link: string; message: string; onDismiss: () => void }) {
+  return <section role="status" aria-label="复制结果" className="absolute inset-x-3 bottom-3 z-50 mx-auto max-w-2xl rounded-xl border border-amber-300/25 bg-slate-950/95 p-4 shadow-xl backdrop-blur">
+    <div className="flex items-start justify-between gap-3"><div><h2 className="text-sm font-semibold text-amber-100">{message}</h2><p className="mt-1 text-xs text-white/65">复制尝试已发起，提示已关闭。可点击文本框并全选手动复制；无需再次确认。</p></div><button type="button" aria-label="关闭复制失败提示" onClick={onDismiss} className="rounded-lg p-1 text-white/70 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 active:scale-95"><X size={16}/></button></div>
+    <textarea aria-label="可手动选择的雷达链接" readOnly value={link} onFocus={(event) => event.currentTarget.select()} className="mt-3 max-h-20 min-h-12 w-full select-all resize-y rounded-lg border border-white/15 bg-black/40 p-2 font-mono text-xs text-white/90 outline-none focus-visible:ring-2 focus-visible:ring-white/50" />
+  </section>
 }
 
 function OfflineVersionNotice({ message, onDismiss, onRetry }: { message: string; onDismiss: () => void; onRetry: () => void }) {

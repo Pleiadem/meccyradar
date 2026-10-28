@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +30,14 @@ type changeServerMock struct {
 	loginCalls      atomic.Int32
 	rejectReason    atomic.Value // string，首次换服返回的租约失效原因
 	lastChangeLease atomic.Value // string
+	logoutMu        sync.Mutex
+	logoutLeases    []string
+	changeStarted   chan struct{}
+	releaseChange   chan struct{}
+	changeBlockOnce sync.Once
+	logoutStarted   chan struct{}
+	releaseLogout   chan struct{}
+	logoutBlockOnce sync.Once
 }
 
 func newChangeServerMock(t *testing.T) *changeServerMock {
@@ -49,6 +59,12 @@ func newChangeServerMock(t *testing.T) *changeServerMock {
 				}
 				_ = json.NewDecoder(r.Body).Decode(&request)
 				m.lastChangeLease.Store(request.LeaseID)
+				if m.changeStarted != nil {
+					m.changeBlockOnce.Do(func() {
+						close(m.changeStarted)
+						<-m.releaseChange
+					})
+				}
 				if reason, _ := m.rejectReason.Load().(string); call == 1 && reason != "" {
 					w.WriteHeader(http.StatusUnauthorized)
 					_ = json.NewEncoder(w).Encode(map[string]any{"detail": "登录状态已失效", "reason": reason})
@@ -84,7 +100,22 @@ func newChangeServerMock(t *testing.T) *changeServerMock {
 					},
 				},
 			})
-		case "/api/client/heartbeat", "/api/client/logout":
+		case "/api/client/heartbeat":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "ok", "data": nil})
+		case "/api/client/logout":
+			if m.logoutStarted != nil {
+				m.logoutBlockOnce.Do(func() {
+					close(m.logoutStarted)
+					<-m.releaseLogout
+				})
+			}
+			var request struct {
+				LeaseID string `json:"leaseId"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			m.logoutMu.Lock()
+			m.logoutLeases = append(m.logoutLeases, request.LeaseID)
+			m.logoutMu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "ok", "data": nil})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -221,6 +252,63 @@ func TestChangeServerDoesNotRecoverTakeoverOrLogout(t *testing.T) {
 				t.Fatal("不得自动重登或重试换服")
 			}
 		})
+	}
+}
+
+type saveFailSessionStore struct {
+	inner *config.MemoryStore
+	fail  atomic.Bool
+}
+
+func (s *saveFailSessionStore) Save(session config.Session) error {
+	if s.fail.Load() {
+		return errors.New("injected credential persistence failure")
+	}
+	return s.inner.Save(session)
+}
+func (s *saveFailSessionStore) Load() (config.Session, error) { return s.inner.Load() }
+func (s *saveFailSessionStore) Clear() error                  { return s.inner.Clear() }
+
+func TestChangeServerPersistenceFailureReleasesNewLeaseAndDoesNotReportSuccess(t *testing.T) {
+	m := newChangeServerMock(t)
+	store := &saveFailSessionStore{inner: config.NewMemoryStore()}
+	client, err := auth.NewClient(m.server.URL, m.server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(appDependencies{client: client, store: store})
+	if _, err := app.LoginByCard("CARD-PERSIST-FAIL"); err != nil {
+		t.Fatal(err)
+	}
+	store.fail.Store(true)
+	result, err := app.ChangeServer()
+	if err == nil || !errors.Is(err, errRefreshedAuthNotAdopted) {
+		t.Fatalf("new lease must not be reported as an adopted change: result=%+v err=%v", result, err)
+	}
+	if result.LeaseID != "" || result.TunnelStatus != "" {
+		t.Fatalf("persistence failure must not return a successful auth DTO: %+v", result)
+	}
+	app.mu.Lock()
+	authData := app.authData
+	engine, mon := app.engine, app.monitor
+	app.mu.Unlock()
+	if authData != nil || engine != nil || mon != nil {
+		t.Fatal("failed adoption must clear the old session and leave the old tunnel stopped")
+	}
+	if m.loginCalls.Load() != 1 || m.calls.Load() != 1 {
+		t.Fatalf("must not create another lease/takeover: login=%d change=%d", m.loginCalls.Load(), m.calls.Load())
+	}
+	m.logoutMu.Lock()
+	logoutLeases := append([]string(nil), m.logoutLeases...)
+	m.logoutMu.Unlock()
+	foundNewLease := false
+	for _, lease := range logoutLeases {
+		if lease == "lease-2" {
+			foundNewLease = true
+		}
+	}
+	if !foundNewLease {
+		t.Fatalf("unadopted server-issued lease was not explicitly released: %v", logoutLeases)
 	}
 }
 

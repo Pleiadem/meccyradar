@@ -36,6 +36,7 @@ func (a *App) ChangeServer() (AuthResultDTO, error) {
 
 	a.mu.Lock()
 	client, data, cardKey := a.deps.client, a.authData, a.cardKey
+	fence := a.sessionFenceLocked()
 	a.mu.Unlock()
 
 	if client == nil || data == nil {
@@ -56,6 +57,10 @@ func (a *App) ChangeServer() (AuthResultDTO, error) {
 		a.versionUseMu.RUnlock()
 		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
 	}
+	if !a.sessionFenceActive(fence) {
+		a.versionUseMu.RUnlock()
+		return AuthResultDTO{}, errSessionGenerationChanged
+	}
 	refreshed, err := client.ChangeServer(context.Background(), cardKey, data.Session.LeaseID)
 	changeAttempted := true
 	// 只有服务端明确确认旧租约超时或因迁移失效，才自动登录并重试一次。
@@ -63,16 +68,29 @@ func (a *App) ChangeServer() (AuthResultDTO, error) {
 	var statusErr *auth.StatusError
 	if errors.As(err, &statusErr) && statusErr.Status == 401 &&
 		(statusErr.Reason == auth.LeaseReasonTTL || statusErr.Reason == auth.LeaseReasonMigrate) {
-		a.emitLog("登录状态已超时，正在恢复后更换服务器")
-		var renewed auth.AuthData
-		changeAttempted = false
-		renewed, err = client.Login(context.Background(), cardKey)
-		if err == nil {
-			a.adoptRefreshedAuth(renewed, data)
-			a.emitSessionRestored()
-			data = &renewed
-			changeAttempted = true
-			refreshed, err = client.ChangeServer(context.Background(), cardKey, data.Session.LeaseID)
+		if !a.sessionFenceActive(fence) {
+			err = errSessionGenerationChanged
+		} else {
+			a.emitLog("登录状态已超时，正在恢复后更换服务器")
+			var renewed auth.AuthData
+			changeAttempted = false
+			renewed, err = client.Login(context.Background(), cardKey)
+			if err == nil {
+				if _, adoptErr := a.adoptRefreshedAuth(renewed, data, fence); adoptErr != nil {
+					a.versionUseMu.RUnlock()
+					_ = a.logoutIfSessionCurrent(fence)
+					return AuthResultDTO{}, adoptErr
+				}
+				fence = a.currentSessionFence()
+				a.emitSessionRestored()
+				data = &renewed
+				changeAttempted = true
+				if !a.sessionFenceActive(fence) {
+					err = errSessionGenerationChanged
+				} else {
+					refreshed, err = client.ChangeServer(context.Background(), cardKey, data.Session.LeaseID)
+				}
+			}
 		}
 	}
 	a.versionUseMu.RUnlock()
@@ -80,48 +98,57 @@ func (a *App) ChangeServer() (AuthResultDTO, error) {
 		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
 	}
 	if err != nil {
+		if errors.Is(err, errSessionGenerationChanged) || !a.sessionFenceActive(fence) {
+			return AuthResultDTO{}, errSessionGenerationChanged
+		}
+		if errors.Is(err, errRefreshedAuthNotAdopted) {
+			_ = a.logoutIfSessionCurrent(fence)
+			return AuthResultDTO{}, err
+		}
 		// 请求结果未知时，先用一次普通登录向服务端核对当前权威配置。
 		// 这覆盖“服务端已提交但 HTTP 响应丢失”的窗口，避免盲目重启旧 token。
 		if wasRunning {
 			if changeAttempted {
-				if reconciled, reconcileErr := a.reconcileChangeFailure(client, cardKey, data, err); reconcileErr == nil {
+				if reconciled, reconcileErr := a.reconcileChangeFailure(client, cardKey, data, fence, err); reconcileErr == nil {
 					return reconciled, nil
+				} else if errors.Is(reconcileErr, errRefreshedAuthNotAdopted) {
+					return AuthResultDTO{}, reconcileErr
+				} else if !a.sessionFenceActive(fence) {
+					return AuthResultDTO{}, errSessionGenerationChanged
 				}
 			}
-			if restartErr := a.startTunnelWithoutLeaseRefresh(); restartErr != nil {
+			if !a.sessionFenceActive(fence) {
+				return AuthResultDTO{}, errSessionGenerationChanged
+			}
+			if restartErr := a.startTunnelForSession(fence, false); restartErr != nil {
 				a.emitLog("换服失败，且恢复原连接也失败：" + restartErr.Error())
 			}
 		}
 		return AuthResultDTO{}, err
 	}
 
-	// adoptRefreshedAuth 会把新 leaseId、新 frpConfig、新到期时间写回内存与磁盘，
-	// 同时刷新 leaseGuard —— 否则下一次心跳还会拿旧租约。
-	a.adoptRefreshedAuth(refreshed, data)
+	// 服务端已经签发新租约；本地未能安全采用时释放该租约、清除旧登录态，
+	// 不能让旧隧道或旧 lease 继续运行，也不能向前端返回换服成功。
+	if _, adoptErr := a.adoptRefreshedAuth(refreshed, data, fence); adoptErr != nil {
+		_ = a.logoutIfSessionCurrent(fence)
+		return AuthResultDTO{}, adoptErr
+	}
 	a.emitSessionRestored()
 	a.emitLog("已更换服务器，正在重新连接")
 
-	if err := a.startTunnel(); err != nil {
+	if err := a.startTunnelForSession(fence, true); err != nil {
 		// 换服本身成功了，只是新连接没起来。如实上报，不谎报成功。
-		return AuthResultDTO{
-			AppName:      refreshed.AppName,
-			ExpireAtStr:  refreshed.ExpireAtStr,
-			ExpireAtUnix: refreshed.ExpireAtUnix,
-			TunnelStatus: "error",
-			Warning:      refreshed.Warning,
-		}, err
+		result := authResultDTO(refreshed, "error")
+		result.Warning = refreshed.Warning
+		return result, err
 	}
 
-	return AuthResultDTO{
-		AppName:      refreshed.AppName,
-		ExpireAtStr:  refreshed.ExpireAtStr,
-		ExpireAtUnix: refreshed.ExpireAtUnix,
-		TunnelStatus: "connecting",
-		Warning:      refreshed.Warning,
-	}, nil
+	result := authResultDTO(refreshed, "connecting")
+	result.Warning = refreshed.Warning
+	return result, nil
 }
 
-func (a *App) reconcileChangeFailure(client *auth.Client, cardKey string, previous *auth.AuthData, cause error) (AuthResultDTO, error) {
+func (a *App) reconcileChangeFailure(client *auth.Client, cardKey string, previous *auth.AuthData, fence sessionFence, cause error) (AuthResultDTO, error) {
 	// 只有传输层错误代表“请求结果未知”；业务 4xx/5xx 已经是服务端明确答复，
 	// 不要再额外登录改变服务端状态。
 	var transportErr *auth.TransportError
@@ -133,6 +160,10 @@ func (a *App) reconcileChangeFailure(client *auth.Client, cardKey string, previo
 		a.versionUseMu.RUnlock()
 		return AuthResultDTO{}, errors.New("此版本已停止使用，请更新后继续")
 	}
+	if !a.sessionFenceActive(fence) {
+		a.versionUseMu.RUnlock()
+		return AuthResultDTO{}, errSessionGenerationChanged
+	}
 	refreshed, err := client.Login(context.Background(), cardKey)
 	a.versionUseMu.RUnlock()
 	if a.versionBlocked() {
@@ -141,14 +172,16 @@ func (a *App) reconcileChangeFailure(client *auth.Client, cardKey string, previo
 	if err != nil {
 		return AuthResultDTO{}, err
 	}
-	a.adoptRefreshedAuth(refreshed, previous)
-	if err := a.startTunnelWithoutLeaseRefresh(); err != nil {
+	if _, adoptErr := a.adoptRefreshedAuth(refreshed, previous, fence); adoptErr != nil {
+		_ = a.logoutIfSessionCurrent(fence)
+		return AuthResultDTO{}, adoptErr
+	}
+	if err := a.startTunnelForSession(fence, false); err != nil {
 		return AuthResultDTO{}, err
 	}
-	return AuthResultDTO{
-		AppName: refreshed.AppName, ExpireAtStr: refreshed.ExpireAtStr,
-		ExpireAtUnix: refreshed.ExpireAtUnix, TunnelStatus: "connecting", Warning: refreshed.Warning,
-	}, nil
+	result := authResultDTO(refreshed, "connecting")
+	result.Warning = refreshed.Warning
+	return result, nil
 }
 
 // 编译期确认：换服解析复用的是登录那套结构。

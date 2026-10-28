@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"meccyradar/internal/auth"
-	"meccyradar/internal/config"
 	"meccyradar/internal/monitor"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -197,6 +196,7 @@ func (a *App) recoverLease(ctx context.Context, cause error) (monitor.LeaseRecov
 	a.mu.Lock()
 	client, cardKey := a.deps.client, a.cardKey
 	oldConfig := a.authData
+	fence := a.sessionFenceLocked()
 	a.mu.Unlock()
 	if client == nil || strings.TrimSpace(cardKey) == "" {
 		return monitor.LeaseRecovery{}, false
@@ -213,9 +213,16 @@ func (a *App) recoverLease(ctx context.Context, cause error) (monitor.LeaseRecov
 			case <-time.After(delay):
 			}
 		}
+		if !a.sessionFenceActive(fence) {
+			return monitor.LeaseRecovery{}, false
+		}
 		data, err := client.Login(ctx, cardKey)
 		if err == nil {
-			recovery := a.adoptRefreshedAuth(data, oldConfig)
+			recovery, adoptErr := a.adoptRefreshedAuth(data, oldConfig, fence)
+			if adoptErr != nil {
+				a.emitDiagnosis(errRefreshedAuthNotAdopted.Error())
+				return monitor.LeaseRecovery{}, false
+			}
 			a.lease.noteRecovered()
 			a.emitLog("登录状态已恢复")
 			return recovery, true
@@ -247,26 +254,62 @@ func (a *App) recoverLease(ctx context.Context, cause error) (monitor.LeaseRecov
 	return monitor.LeaseRecovery{}, false
 }
 
-// adoptRefreshedAuth 把重登拿到的新会话写回内存与磁盘，返回 monitor 需要的恢复结果。
-func (a *App) adoptRefreshedAuth(data auth.AuthData, previous *auth.AuthData) monitor.LeaseRecovery {
+var errRefreshedAuthNotAdopted = errors.New("无法安全保存服务端签发的新会话；旧连接已停止，请检查本地凭据存储后重新登录")
+
+// releaseUnadoptedLease prevents a successful server login whose local state
+// could not be committed from being left as an active, abandoned lease.
+func (a *App) releaseUnadoptedLease(data auth.AuthData, currentLease string) {
+	if data.Session.LeaseID == "" || data.Session.LeaseID == currentLease {
+		return
+	}
 	a.mu.Lock()
-	a.authData = &data
-	radarPassword := a.radarPassword
+	client := a.deps.client
+	a.mu.Unlock()
+	if client != nil {
+		if err := client.Logout(context.Background(), data.Session.LeaseID); err != nil {
+			a.emitLog("未采用的新租约无法立即释放，将由服务端超时回收")
+		}
+	}
+}
+
+// adoptRefreshedAuth persists and adopts a lease issued by a successful re-login.
+func (a *App) adoptRefreshedAuth(data auth.AuthData, previous *auth.AuthData, expected sessionFence) (monitor.LeaseRecovery, error) {
+	a.mu.Lock()
+	generation := a.sessionGeneration
 	cardKey := a.cardKey
+	currentLease := ""
+	currentFence := a.sessionFenceLocked()
+	if a.authData != nil {
+		currentLease = a.authData.Session.LeaseID
+	}
+	if cardKey == "" || currentLease == "" || !sameSessionFence(currentFence, expected) ||
+		(previous != nil && previous.Session.LeaseID != currentLease) {
+		a.mu.Unlock()
+		a.releaseUnadoptedLease(data, currentLease)
+		return monitor.LeaseRecovery{}, errRefreshedAuthNotAdopted
+	}
 	a.mu.Unlock()
 
-	if a.deps.store != nil {
-		// 与 LoginByCard 一样：只写 CardKey 会把已保存的雷达密码抹掉。
-		_ = a.deps.store.Save(config.Session{
-			CardKey:       cardKey,
-			SavedAtUnix:   time.Now().Unix(),
-			RadarPassword: radarPassword,
-		})
+	// Persist under the same generation fence as login/ack and before publishing
+	// refreshed auth. Logout can invalidate this write without holding App.mu.
+	if err := a.saveSessionForCurrent(generation, cardKey); err != nil {
+		a.releaseUnadoptedLease(data, currentLease)
+		return monitor.LeaseRecovery{}, errRefreshedAuthNotAdopted
 	}
+	a.mu.Lock()
+	if a.sessionGeneration != generation || a.cardKey != cardKey || a.authData == nil ||
+		a.authData.Session.LeaseID != currentLease || !sameSessionFence(a.sessionFenceLocked(), expected) {
+		a.mu.Unlock()
+		a.releaseUnadoptedLease(data, currentLease)
+		return monitor.LeaseRecovery{}, errRefreshedAuthNotAdopted
+	}
+	a.authData = &data
+	a.mu.Unlock()
 	a.lease.markHealthy(time.Now())
+	a.resumePendingLinkAck(data)
 
 	configChanged := previous == nil || !frpConfigEqual(previous.FRPConfig, data.FRPConfig)
-	return monitor.LeaseRecovery{LeaseID: data.Session.LeaseID, ConfigChanged: configChanged}
+	return monitor.LeaseRecovery{LeaseID: data.Session.LeaseID, ConfigChanged: configChanged}, nil
 }
 
 // frpConfigEqual 判断两份 FRPC 配置是否等价。
@@ -383,6 +426,7 @@ func (a *App) restartTunnelAfterRecovery() error {
 func (a *App) refreshStaleLeaseBeforeStart(ctx context.Context) error {
 	a.mu.Lock()
 	client, cardKey, data := a.deps.client, a.cardKey, a.authData
+	fence := a.sessionFenceLocked()
 	a.mu.Unlock()
 	if client == nil || data == nil || strings.TrimSpace(cardKey) == "" {
 		return nil
@@ -390,12 +434,18 @@ func (a *App) refreshStaleLeaseBeforeStart(ctx context.Context) error {
 	if !a.lease.stale(time.Now()) {
 		return nil
 	}
+	if !a.sessionFenceActive(fence) {
+		return errSessionGenerationChanged
+	}
 	a.emitLog("检测到登录状态可能已过期，正在重新登录")
 	refreshed, err := client.Login(ctx, cardKey)
 	if err != nil {
 		// 被别的设备顶掉时不能"重试到成功"：直接如实上报。
 		return err
 	}
-	a.adoptRefreshedAuth(refreshed, data)
+	if _, err := a.adoptRefreshedAuth(refreshed, data, fence); err != nil {
+		_ = a.logoutIfSessionCurrent(fence)
+		return err
+	}
 	return nil
 }

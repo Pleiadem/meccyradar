@@ -20,7 +20,9 @@ type Session struct {
 	SavedAtUnix int64  `json:"savedAtUnix"`
 	// 雷达密码由用户填写，需要跨重启保留：否则每次启动后复制出的链接
 	// 都会缺 k= 参数（生产上表现为 "...&k="）。
-	RadarPassword string `json:"radarPassword,omitempty"`
+	RadarPassword         string `json:"radarPassword,omitempty"`
+	PendingLinkAckVersion int    `json:"pendingLinkAckVersion,omitempty"`
+	PendingLinkAckLeaseID string `json:"pendingLinkAckLeaseId,omitempty"`
 }
 
 type CredentialStore interface {

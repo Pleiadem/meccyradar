@@ -56,6 +56,9 @@ type InitStateDTO struct {
 	ExpireAtUnix  int64  `json:"expireAtUnix,omitempty"`
 	ExpiresIn     int64  `json:"expiresIn,omitempty"`
 	TunnelStatus  string `json:"tunnelStatus"`
+	LeaseID       string `json:"leaseId,omitempty"`
+	LinkVersion   int    `json:"linkVersion,omitempty"`
+	CopyPending   bool   `json:"copyPending,omitempty"`
 }
 
 type AuthResultDTO struct {
@@ -64,6 +67,16 @@ type AuthResultDTO struct {
 	ExpireAtUnix int64  `json:"expireAtUnix"`
 	TunnelStatus string `json:"tunnelStatus"`
 	Warning      string `json:"warning,omitempty"`
+	LeaseID      string `json:"leaseId,omitempty"`
+	LinkVersion  int    `json:"linkVersion,omitempty"`
+	CopyPending  bool   `json:"copyPending,omitempty"`
+}
+
+type ShareLinkAttemptDTO struct {
+	Attempted bool   `json:"attempted"`
+	Copied    bool   `json:"copied"`
+	Link      string `json:"link,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type TunnelStatusDTO struct {
@@ -115,12 +128,16 @@ type loginAttempt struct {
 type App struct {
 	ctx context.Context
 
-	mu               sync.Mutex
-	changeMu         sync.Mutex
-	loginMu          sync.Mutex
-	loginInFlight    *loginAttempt
-	loginGeneration  uint64
-	logoutInProgress bool
+	mu                sync.Mutex
+	sessionStoreMu    sync.Mutex
+	changeMu          sync.Mutex
+	loginMu           sync.Mutex
+	loginInFlight     *loginAttempt
+	loginGeneration   uint64
+	sessionGeneration uint64
+	logoutInProgress  bool
+	logoutRequests    int
+	logoutMu          sync.Mutex
 	// Test hooks make lifecycle race windows deterministic without affecting production.
 	loginBeforeJoin   func(string)
 	loginBeforeCommit func()
@@ -128,11 +145,22 @@ type App struct {
 	authData          *auth.AuthData
 	cardKey           string
 	// 雷达密码：来自界面输入，随会话持久化，重启后自动带出。
-	radarPassword string
-	engine        *frpengine.Engine
-	monitor       *monitor.Monitor
-	lastStatus    string
-	initErr       error
+	radarPassword             string
+	radarPasswordRevision     uint64
+	radarPasswordInitialized  bool
+	pendingLinkAckVersion     int
+	pendingLinkAckInitialized bool
+	pendingLinkAckLeaseID     string
+	pendingLinkAckCardKey     string
+	pendingLinkAckGeneration  uint64
+	linkAckMu                 sync.Mutex
+	linkAckRunning            bool
+	linkAckTask               linkAckTask
+	linkAckEmitter            func(LinkAckEventDTO)
+	engine                    *frpengine.Engine
+	monitor                   *monitor.Monitor
+	lastStatus                string
+	initErr                   error
 	// lease 记录手上的租约还能不能用，供 StartTunnel 判断要不要先重登。
 	lease leaseGuard
 	// logEmitter 是测试用的日志出口；生产为 nil，走 runtime.EventsEmit。
@@ -349,19 +377,25 @@ func (a *App) Quit() {
 // loadSession 从凭据存储恢复卡密与雷达密码（供启动流程与测试使用）。
 func (a *App) loadSession() error {
 	a.mu.Lock()
-	store := a.deps.store
+	generation := a.sessionGeneration
 	a.mu.Unlock()
-	if store == nil {
-		return errors.New("凭据存储不可用")
-	}
-	session, err := store.Load()
+	session, err := a.loadStoredSession()
 	if err != nil {
 		return err
 	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if generation != a.sessionGeneration {
+		return errors.New("会话已变化，请重试")
+	}
 	a.cardKey = session.CardKey
 	a.radarPassword = session.RadarPassword
-	a.mu.Unlock()
+	a.radarPasswordInitialized = true
+	a.pendingLinkAckVersion = session.PendingLinkAckVersion
+	a.pendingLinkAckLeaseID = session.PendingLinkAckLeaseID
+	a.pendingLinkAckCardKey = session.CardKey
+	a.pendingLinkAckGeneration = a.sessionGeneration
+	a.pendingLinkAckInitialized = true
 	return nil
 }
 
@@ -376,17 +410,15 @@ func (a *App) RadarPassword() string {
 func (a *App) SaveRadarPassword(password string) error {
 	a.mu.Lock()
 	a.radarPassword = password
-	cardKey, store := a.cardKey, a.deps.store
+	a.radarPasswordRevision++
+	a.radarPasswordInitialized = true
+	cardKey, generation := a.cardKey, a.sessionGeneration
 	a.mu.Unlock()
-	if store == nil || cardKey == "" {
+	if cardKey == "" {
 		// 未登录时只留在内存，登录后由会话保存带走。
 		return nil
 	}
-	return store.Save(config.Session{
-		CardKey:       cardKey,
-		SavedAtUnix:   time.Now().Unix(),
-		RadarPassword: password,
-	})
+	return a.saveSessionForCurrent(generation, cardKey)
 }
 
 var errSessionAlreadyAuthenticated = errors.New("当前已登录，请先退出当前会话")
@@ -408,11 +440,14 @@ func (a *App) restoreCachedSession() {
 	}
 	store, client, initErr := a.deps.store, a.deps.client, a.initErr
 	a.mu.Unlock()
-	if initErr != nil || store == nil || client == nil {
+	a.loginMu.Lock()
+	restoreGeneration, logoutInProgress := a.loginGeneration, a.logoutInProgress
+	a.loginMu.Unlock()
+	if initErr != nil || store == nil || client == nil || logoutInProgress {
 		a.versionUseMu.RUnlock()
 		return
 	}
-	session, err := store.Load()
+	session, err := a.loadStoredSession()
 	if err != nil {
 		a.versionUseMu.RUnlock()
 		return
@@ -420,7 +455,7 @@ func (a *App) restoreCachedSession() {
 	if hook := a.loginBeforeJoin; hook != nil {
 		hook(session.CardKey)
 	}
-	_, err = a.loginOnce(client, session)
+	_, err = a.loginOnceAtGeneration(client, session, &restoreGeneration)
 	if err != nil {
 		a.versionUseMu.RUnlock()
 		// A manual login can commit after the initial duplicate-operation check.
@@ -474,7 +509,7 @@ func (a *App) SavedCardKey() string {
 	if store == nil {
 		return ""
 	}
-	session, err := store.Load()
+	session, err := a.loadStoredSession()
 	if err != nil {
 		return ""
 	}
@@ -493,6 +528,9 @@ func (a *App) GetInitState() InitStateDTO {
 	state.ExpireAtStr = a.authData.ExpireAtStr
 	state.ExpireAtUnix = a.authData.ExpireAtUnix
 	state.ExpiresIn = maxZero(a.authData.ExpireAtUnix - time.Now().Unix())
+	state.LeaseID = a.authData.Session.LeaseID
+	state.LinkVersion = a.authData.Server.LinkVersion
+	state.CopyPending = a.authData.Server.CopyPending
 	return state
 }
 
@@ -500,8 +538,16 @@ func (a *App) GetInitState() InitStateDTO {
 // The in-flight marker remains present until authData and the credential store have
 // been committed, so a late caller cannot create a second server lease in the gap.
 func (a *App) loginOnce(client *auth.Client, session config.Session) (auth.AuthData, error) {
+	return a.loginOnceAtGeneration(client, session, nil)
+}
+
+func (a *App) loginOnceAtGeneration(client *auth.Client, session config.Session, expectedGeneration *uint64) (auth.AuthData, error) {
 	cardKey := session.CardKey
 	a.loginMu.Lock()
+	if expectedGeneration != nil && *expectedGeneration != a.loginGeneration {
+		a.loginMu.Unlock()
+		return auth.AuthData{}, errors.New("会话已变化，请重新登录")
+	}
 	if a.logoutInProgress {
 		a.loginMu.Unlock()
 		return auth.AuthData{}, errors.New("正在退出登录，请稍后重试")
@@ -546,24 +592,50 @@ func (a *App) loginOnce(client *auth.Client, session config.Session) (auth.AuthD
 	if err == nil {
 		a.mu.Lock()
 		store := a.deps.store
-		radarPassword := session.RadarPassword
-		if radarPassword == "" {
-			radarPassword = a.radarPassword
-		}
 		a.mu.Unlock()
 		if store == nil {
 			err = errors.New("凭据存储不可用")
 		} else {
-			err = store.Save(config.Session{CardKey: cardKey, SavedAtUnix: time.Now().Unix(), RadarPassword: radarPassword})
-		}
-		if err == nil {
-			a.mu.Lock()
-			a.cardKey = cardKey
-			a.radarPassword = radarPassword
-			a.authData = &data
-			a.lastStatus = "idle"
-			a.mu.Unlock()
-			a.lease.markHealthy(time.Now())
+			var savedSession config.Session
+			var passwordRevision uint64
+			savedSession, passwordRevision, err = a.saveLoginSession(attempt.generation, cardKey)
+			if err == nil {
+				session = savedSession
+				a.mu.Lock()
+				a.sessionGeneration++
+				a.cardKey = cardKey
+				if !a.radarPasswordInitialized {
+					a.radarPassword = session.RadarPassword
+					a.radarPasswordInitialized = true
+				}
+				a.pendingLinkAckVersion = session.PendingLinkAckVersion
+				a.pendingLinkAckLeaseID = session.PendingLinkAckLeaseID
+				a.pendingLinkAckCardKey = cardKey
+				a.pendingLinkAckGeneration = a.sessionGeneration
+				a.pendingLinkAckInitialized = true
+				a.authData = &data
+				a.lastStatus = "idle"
+				committedGeneration := a.sessionGeneration
+				passwordChangedDuringSave := a.radarPasswordRevision != passwordRevision
+				a.mu.Unlock()
+				if passwordChangedDuringSave {
+					if saveErr := a.saveSessionForCurrent(committedGeneration, cardKey); saveErr != nil {
+						a.mu.Lock()
+						if a.sessionGeneration == committedGeneration && a.authData != nil && a.authData.Session.LeaseID == data.Session.LeaseID {
+							a.sessionGeneration++
+							a.authData = nil
+							a.cardKey = ""
+							a.clearPendingLinkAckLocked()
+						}
+						a.mu.Unlock()
+						_ = a.clearStoredSession()
+						err = errors.New("登录时更新的雷达密码无法安全保存，请检查凭据存储后重试")
+					}
+				}
+				if err == nil {
+					a.lease.markHealthy(time.Now())
+				}
+			}
 		}
 	}
 	attempt.data, attempt.err = data, err
@@ -575,6 +647,8 @@ func (a *App) loginOnce(client *auth.Client, session config.Session) (auth.AuthD
 	// won the race) still created a remote lease; release this exact response.
 	if err != nil && data.Session.LeaseID != "" {
 		_ = client.Logout(context.Background(), data.Session.LeaseID)
+	} else if err == nil {
+		a.resumePendingLinkAck(data)
 	}
 	return data, err
 }
@@ -606,15 +680,19 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	a.mu.Lock()
 	radarPassword := a.radarPassword
 	a.mu.Unlock()
-	if radarPassword == "" {
-		if saved, loadErr := store.Load(); loadErr == nil && saved.CardKey == cardKey {
-			radarPassword = saved.RadarPassword
+	loginSession := config.Session{CardKey: cardKey, RadarPassword: radarPassword}
+	if saved, loadErr := a.loadStoredSession(); loadErr == nil && saved.CardKey == cardKey {
+		if loginSession.RadarPassword == "" {
+			loginSession.RadarPassword = saved.RadarPassword
 		}
+		loginSession.PendingLinkAckVersion = saved.PendingLinkAckVersion
+		loginSession.PendingLinkAckLeaseID = saved.PendingLinkAckLeaseID
 	}
+	radarPassword = loginSession.RadarPassword
 	if hook := a.loginBeforeJoin; hook != nil {
 		hook(cardKey)
 	}
-	data, err := a.loginOnce(client, config.Session{CardKey: cardKey, RadarPassword: radarPassword})
+	data, err := a.loginOnce(client, loginSession)
 	if err != nil {
 		var conflictErr *auth.ConflictError
 		if errors.As(err, &conflictErr) {
@@ -631,33 +709,66 @@ func (a *App) LoginByCard(cardKey string) (AuthResultDTO, error) {
 	if hasRuntime {
 		a.startPortProbe()
 	}
-	return AuthResultDTO{AppName: data.AppName, ExpireAtStr: data.ExpireAtStr, ExpireAtUnix: data.ExpireAtUnix, TunnelStatus: "idle"}, nil
+	a.mu.Lock()
+	if a.authData != nil && a.authData.Session.LeaseID == data.Session.LeaseID {
+		data = *a.authData
+	}
+	a.mu.Unlock()
+	return authResultDTO(data, "idle"), nil
+}
+
+func authResultDTO(data auth.AuthData, status string) AuthResultDTO {
+	return AuthResultDTO{
+		AppName: data.AppName, ExpireAtStr: data.ExpireAtStr, ExpireAtUnix: data.ExpireAtUnix,
+		TunnelStatus: status, Warning: data.Warning, LeaseID: data.Session.LeaseID,
+		LinkVersion: data.Server.LinkVersion, CopyPending: data.Server.CopyPending,
+	}
 }
 
 func (a *App) StartTunnel() error { return a.startTunnel() }
 
-func (a *App) startTunnel() error { return a.startTunnelWithLeaseRefresh(true) }
+func (a *App) startTunnel() error { return a.startTunnelWithLeaseRefresh(true, nil) }
 
-func (a *App) startTunnelWithoutLeaseRefresh() error { return a.startTunnelWithLeaseRefresh(false) }
+func (a *App) startTunnelWithoutLeaseRefresh() error {
+	return a.startTunnelWithLeaseRefresh(false, nil)
+}
 
-func (a *App) startTunnelWithLeaseRefresh(refreshLease bool) error {
+func (a *App) startTunnelForSession(fence sessionFence, refreshLease bool) error {
+	return a.startTunnelWithLeaseRefresh(refreshLease, &fence)
+}
+
+func (a *App) startTunnelWithLeaseRefresh(refreshLease bool, expected *sessionFence) error {
 	a.versionUseMu.RLock()
 	defer a.versionUseMu.RUnlock()
 	if a.versionBlocked() {
 		return errors.New("此版本已停止使用，请更新后继续")
 	}
+	a.loginMu.Lock()
+	if a.logoutInProgress {
+		a.loginMu.Unlock()
+		return errSessionGenerationChanged
+	}
 	a.mu.Lock()
 	if a.authData == nil {
 		a.mu.Unlock()
+		a.loginMu.Unlock()
 		return errNotAuthenticated
 	}
 	if a.engine != nil && a.engine.Running() {
 		a.mu.Unlock()
+		a.loginMu.Unlock()
 		return frpengine.ErrAlreadyRunning
+	}
+	initialFence := a.sessionFenceLocked()
+	if expected != nil && (initialFence.generation != expected.generation || initialFence.cardKey != expected.cardKey) {
+		a.mu.Unlock()
+		a.loginMu.Unlock()
+		return errSessionGenerationChanged
 	}
 	data := *a.authData
 	ctx := a.ctx
 	a.mu.Unlock()
+	a.loginMu.Unlock()
 
 	// 休眠一夜/长时间断网后，内存里的租约可能早已过期。直接拿它启动 FRPC
 	// 会得到"start proxy success + 1 秒后心跳 401"的假成功，所以先换新租约。
@@ -668,11 +779,22 @@ func (a *App) startTunnelWithLeaseRefresh(refreshLease bool) error {
 			return err
 		}
 	}
-	a.mu.Lock()
-	if a.authData != nil {
-		data = *a.authData
+	a.loginMu.Lock()
+	if a.logoutInProgress {
+		a.loginMu.Unlock()
+		return errSessionGenerationChanged
 	}
+	a.mu.Lock()
+	currentFence := a.sessionFenceLocked()
+	if a.authData == nil || currentFence.generation != initialFence.generation || currentFence.cardKey != initialFence.cardKey {
+		a.mu.Unlock()
+		a.loginMu.Unlock()
+		return errSessionGenerationChanged
+	}
+	data = *a.authData
+	startFence := currentFence
 	a.mu.Unlock()
+	a.loginMu.Unlock()
 
 	a.emitStatus("connecting", 0, "", false, false)
 	engine, err := frpengine.NewWithExit(data.FRPConfig, a.handleEngineLog, func(err error) { a.handleEngineExit(err) })
@@ -721,10 +843,19 @@ func (a *App) startTunnelWithLeaseRefresh(refreshLease bool) error {
 		_ = engine.Stop()
 		return err
 	}
+	a.loginMu.Lock()
 	a.mu.Lock()
+	if a.logoutInProgress || !sameSessionFence(a.sessionFenceLocked(), startFence) {
+		a.mu.Unlock()
+		a.loginMu.Unlock()
+		_ = mon.Stop()
+		_ = engine.Stop()
+		return errSessionGenerationChanged
+	}
 	a.engine, a.monitor = engine, mon
 	a.lastStatus = "connecting"
 	a.mu.Unlock()
+	a.loginMu.Unlock()
 	_ = ctx
 	return nil
 }
@@ -828,36 +959,108 @@ func (a *App) RemeasurePing() error {
 	return mon.RemeasurePingAsync(ctx)
 }
 
-func (a *App) Logout() error {
-	// Invalidate any in-flight login before stopping the monitor. Do not hold
-	// loginMu across stopTunnel: monitor recovery can itself be waiting on login.
+func (a *App) beginLogout(expected *sessionFence) (sessionFence, bool) {
 	a.loginMu.Lock()
-	a.loginGeneration++
-	a.logoutInProgress = true
-	a.loginMu.Unlock()
-	defer func() {
-		a.loginMu.Lock()
-		a.logoutInProgress = false
+	a.mu.Lock()
+	current := a.sessionFenceLocked()
+	if expected != nil && (a.logoutInProgress || !sameSessionFence(current, *expected)) {
+		a.mu.Unlock()
 		a.loginMu.Unlock()
-	}()
+		return sessionFence{}, false
+	}
+	target := current
+	a.loginGeneration++
+	a.logoutRequests++
+	a.logoutInProgress = true
+	a.sessionGeneration++
+	a.pendingLinkAckGeneration = 0
+	a.pendingLinkAckCardKey = ""
+	a.mu.Unlock()
+	a.loginMu.Unlock()
+	return target, true
+}
+
+func (a *App) finishLogout() {
+	a.loginMu.Lock()
+	if a.logoutRequests > 0 {
+		a.logoutRequests--
+	}
+	a.logoutInProgress = a.logoutRequests > 0
+	a.loginMu.Unlock()
+}
+
+func (a *App) performLogout(target sessionFence) error {
+	// Serialize whole cleanup procedures. A queued Logout is held behind the
+	// barrier counter, so no login can slip between two overlapping exits.
+	a.logoutMu.Lock()
+	defer a.logoutMu.Unlock()
+
+	a.mu.Lock()
+	current := a.sessionFenceLocked()
+	if target.cardKey != "" && (current.cardKey != target.cardKey || current.leaseID != target.leaseID) {
+		a.mu.Unlock()
+		return nil
+	}
+	client, data := a.deps.client, a.authData
+	a.mu.Unlock()
+
 	_ = a.stopTunnel()
 	a.stopPortProbe()
 	a.mu.Lock()
-	client, store, data := a.deps.client, a.deps.store, a.authData
+	current = a.sessionFenceLocked()
+	if target.cardKey != "" && (current.cardKey != target.cardKey || current.leaseID != target.leaseID) {
+		a.mu.Unlock()
+		return nil
+	}
+	client, data = a.deps.client, a.authData
 	a.authData, a.cardKey, a.lastStatus = nil, "", "idle"
+	a.pendingLinkAckVersion = 0
+	a.pendingLinkAckLeaseID = ""
+	a.pendingLinkAckCardKey = ""
+	a.pendingLinkAckGeneration = 0
+	a.pendingLinkAckInitialized = true
 	a.mu.Unlock()
+
 	var firstErr error
 	if data != nil && client != nil {
 		if err := client.Logout(context.Background(), data.Session.LeaseID); err != nil {
 			firstErr = err
 		}
 	}
-	if store != nil {
-		if err := store.Clear(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	if err := a.clearStoredSession(); err != nil && firstErr == nil {
+		firstErr = err
 	}
+	a.emitSessionInvalidated()
 	return firstErr
+}
+
+func (a *App) Logout() error {
+	target, ok := a.beginLogout(nil)
+	if !ok {
+		return nil
+	}
+	defer a.finishLogout()
+	return a.performLogout(target)
+}
+
+// logoutIfSessionCurrent is cleanup for a failed asynchronous operation. It may
+// only log out the session that initiated that operation, never a replacement.
+func (a *App) logoutIfSessionCurrent(expected sessionFence) error {
+	target, ok := a.beginLogout(&expected)
+	if !ok {
+		return nil
+	}
+	defer a.finishLogout()
+	return a.performLogout(target)
+}
+
+func (a *App) emitSessionInvalidated() {
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx != nil {
+		runtime.EventsEmit(ctx, "session:invalidated", map[string]bool{"authenticated": false})
+	}
 }
 
 func (a *App) emitStatus(status string, pingMS int64, message string, done, timeout bool) {

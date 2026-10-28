@@ -58,6 +58,11 @@ type Session struct {
 	LeaseExpireAtUnix int64  `json:"leaseExpireAtUnix"`
 }
 
+type ServerLinkState struct {
+	LinkVersion int  `json:"linkVersion"`
+	CopyPending bool `json:"copyPending"`
+}
+
 type Proxy struct {
 	Name          string   `json:"name"`
 	Type          string   `json:"type"`
@@ -78,13 +83,14 @@ type FRPConfig struct {
 }
 
 type AuthData struct {
-	AppName      string    `json:"appName"`
-	ShareBaseURL string    `json:"shareBaseUrl"`
-	ExpireAtUnix int64     `json:"expireAtUnix"`
-	ExpireAtStr  string    `json:"expireAtStr"`
-	Session      Session   `json:"session"`
-	FRPConfig    FRPConfig `json:"frpConfig"`
-	Warning      string    `json:"warning,omitempty"`
+	AppName      string          `json:"appName"`
+	ShareBaseURL string          `json:"shareBaseUrl"`
+	ExpireAtUnix int64           `json:"expireAtUnix"`
+	ExpireAtStr  string          `json:"expireAtStr"`
+	Session      Session         `json:"session"`
+	FRPConfig    FRPConfig       `json:"frpConfig"`
+	Server       ServerLinkState `json:"server"`
+	Warning      string          `json:"warning,omitempty"`
 }
 
 type envelope struct {
@@ -98,6 +104,14 @@ type loginRequest struct {
 }
 type leaseRequest struct {
 	LeaseID string `json:"leaseId"`
+}
+type linkAckRequest struct {
+	LeaseID     string `json:"leaseId"`
+	LinkVersion int    `json:"linkVersion"`
+}
+type linkAckResponse struct {
+	Accepted bool   `json:"accepted"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 type changeServerRequest struct {
@@ -285,6 +299,21 @@ func (c *Client) Logout(ctx context.Context, leaseID string) error {
 		return nil
 	}
 	return c.doJSON(ctx, http.MethodPost, "/api/client/logout", leaseRequest{LeaseID: leaseID}, &struct{}{})
+}
+
+// AcknowledgeLinkAttempt records only that a clipboard copy attempt was initiated;
+// it intentionally does not claim that the operating system clipboard succeeded.
+func (c *Client) AcknowledgeLinkAttempt(ctx context.Context, leaseID string, version int) (bool, error) {
+	if strings.TrimSpace(leaseID) == "" || version <= 0 {
+		return false, errors.New("缺少链接确认版本或会话")
+	}
+	var response linkAckResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/api/client/link-ack", linkAckRequest{
+		LeaseID: leaseID, LinkVersion: version,
+	}, &response); err != nil {
+		return false, err
+	}
+	return response.Accepted, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
