@@ -2,6 +2,12 @@
 
 MeccyRadar 是面向用户的 Wails v2 + Go + React/TypeScript 客户端。它不负责创建 FRPS 资源，而是向 RentForge 管理端申请租约、接收 FRP 配置、运行本地隧道，并把雷达分享链接复制给用户。
 
+## 界面预览
+
+![MeccyRadar 主界面预览](docs/screenshots/console.png)
+
+截图来自本地开发预览，使用示例数据，不代表真实连接状态。
+
 相关项目：
 
 - **MeccyRadar**：桌面客户端，位于本仓库。
